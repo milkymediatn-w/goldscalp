@@ -79,18 +79,31 @@ def _fetch_mt5(cfg: Config, symbol: str = "XAUUSD"):
 
 def _fetch_twelve(cfg: Config, symbol: str = "XAUUSD") -> pd.DataFrame:
     td_symbol = symbol
+    exchange = None
+    
     if symbol.upper() == "XAUUSD":
         td_symbol = "XAU/USD"
     elif symbol.upper() == "BTCUSD":
         td_symbol = "BTC/USD"
+        exchange = "Binance"  # Forces exact spot pricing from Binance
     elif "/" not in symbol and symbol.endswith("USD"):
         td_symbol = symbol[:-3] + "/USD"
 
     interval = {1: "1min", 5: "5min", 15: "15min", 60: "1h"}[cfg.tf_min]
+    
+    params = {
+        "symbol": td_symbol,
+        "interval": interval,
+        "outputsize": min(cfg.bars, 5000),
+        "timezone": "UTC",
+        "apikey": cfg.twelve_api_key
+    }
+    if exchange:
+        params["exchange"] = exchange
+
     r = httpx.get(
         "https://api.twelvedata.com/time_series",
-        params={"symbol": td_symbol, "interval": interval, "outputsize": min(cfg.bars, 5000),
-                "timezone": "UTC", "apikey": cfg.twelve_api_key},
+        params=params,
         timeout=20,
     )
     j = r.json()
