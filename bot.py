@@ -1,6 +1,6 @@
 """
-GoldScalp Signals Bot - Autonomous Cloud Version (Render + Twelve Data)
-Runs FastAPI health-check server + Telegram Bot + Background Scanner.
+Gold & Crypto Scalping Bot - Autonomous Cloud Version (Render + Twelve Data)
+Runs FastAPI health-check server + Telegram Bot + Multi-Asset Background Scanner.
 """
 import asyncio
 import json
@@ -8,7 +8,7 @@ import logging
 import os
 import sqlite3
 from contextlib import closing
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from threading import Thread
 
 import pandas as pd
@@ -17,7 +17,7 @@ from fastapi import FastAPI
 import uvicorn
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, Forbidden, TelegramError
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 load_dotenv()
@@ -31,26 +31,28 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "30"))
 DB_PATH = os.getenv("DB_PATH", "signals_v2.db")
-BRAND = os.getenv("BRAND_NAME", "GoldScalp Signals")
+BRAND = os.getenv("BRAND_NAME", "Gold & Crypto Scalper")
 SUPPORT = os.getenv("SUPPORT_HANDLE", "@your_support")
 PRICE_TEXT = os.getenv("PRICE_TEXT", "$29 / month")
 DEFAULT_USER_SCORE = int(os.getenv("DEFAULT_USER_SCORE", "40"))
-FREE_DELAY_MIN = int(os.getenv("FREE_DELAY_MIN", "0"))
 TF = {1: "M1", 5: "M5", 15: "M15", 60: "H1"}.get(CFG.tf_min, f"{CFG.tf_min}m")
+
+SYMBOLS = ["XAUUSD", "BTCUSD"]
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
-log = logging.getLogger("goldbot")
-STATE = {"last_scan": None, "last_bar": None, "error": None, "alerted": False, "spread": None, "source": None}
+log = logging.getLogger("tradingbot")
+STATE = {"last_scan": None, "last_bar": None, "error": None, "spread": None, "source": None}
 
 # --- FastAPI Web Server (Required for Render Free Web Service) ---
-app = FastAPI(title="GoldScalp Bot Health")
+app = FastAPI(title="Trading Bot Health")
 
 @app.get("/")
 def health_check():
     return {
         "status": "online",
         "brand": BRAND,
+        "symbols": SYMBOLS,
         "preset": CFG.preset,
         "source": STATE["source"],
         "last_scan": STATE["last_scan"],
@@ -87,6 +89,7 @@ def init_db():
             );
             CREATE TABLE IF NOT EXISTS signals(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT DEFAULT 'XAUUSD',
                 ts TEXT, created TEXT, side TEXT,
                 entry REAL, sl REAL, tp1 REAL, tp2 REAL, tp3 REAL,
                 score INTEGER, atr REAL, spread REAL, reasons TEXT,
@@ -114,9 +117,9 @@ def is_premium(uid: int) -> bool:
     until = premium_until(uid)
     return bool(until and until > now_utc())
 
-def track_open(df: pd.DataFrame) -> list:
+def track_open(df: pd.DataFrame, symbol: str) -> list:
     out = []
-    for r in q("SELECT * FROM signals WHERE status='OPEN'"):
+    for r in q("SELECT * FROM signals WHERE status='OPEN' AND symbol=?", (symbol,)):
         ts = pd.Timestamp(r["ts"])
         if df.index[0] > ts:
             q("UPDATE signals SET status='EXPIRED', closed_ts=?, r=0 WHERE id=?",
@@ -145,10 +148,11 @@ def _rmult(r, key) -> float:
 
 def fmt_signal(r) -> str:
     icon = "🟢" if r["side"] == "BUY" else "🔴"
+    sym = r["symbol"]
     reasons = "\n".join(f"• {x}" for x in json.loads(r["reasons"]))
     be = "Move stop to entry after TP1." if CFG.be_after_tp1 else "Keep the original stop."
     return (
-        f"{icon} <b>{r['side']} XAUUSD</b>  |  {TF}\n\n"
+        f"{icon} <b>{r['side']} {sym}</b>  |  {TF}\n\n"
         f"📍 Entry: <code>{r['entry']:.2f}</code>\n"
         f"🛑 Stop Loss: <code>{r['sl']:.2f}</code>\n"
         f"🎯 TP1: <code>{r['tp1']:.2f}</code>  ({_rmult(r, 'tp1'):.1f}R)\n"
@@ -160,7 +164,7 @@ def fmt_signal(r) -> str:
     )
 
 def fmt_event(r, kind: str, net) -> str:
-    head = f"<b>{r['side']} XAUUSD #{r['id']}</b>"
+    head = f"<b>{r['side']} {r['symbol']} #{r['id']}</b>"
     be = "\nMove your stop to entry." if CFG.be_after_tp1 else ""
     return {
         "TP1": f"✅ {head}: TP1 hit. Bank 1/3.{be}",
@@ -180,7 +184,7 @@ def fmt_performance() -> str:
     gross_loss = -sum(x for x in rs if x < 0)
     pf = f"{sum(wins) / gross_loss:.2f}" if gross_loss > 0 else "∞"
     return (
-        "📊 <b>Verified Performance</b>\n\n"
+        "📊 <b>Verified Performance (All Assets)</b>\n\n"
         f"Closed signals: <b>{n}</b>\n"
         f"Win rate: <b>{len(wins) / n * 100:.0f}%</b>   Profit factor: <b>{pf}</b>\n"
         f"Total: <b>{sum(rs):+.1f}R</b>"
@@ -188,7 +192,7 @@ def fmt_performance() -> str:
 
 def main_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📡 Latest Signal", callback_data="signal"),
+        [InlineKeyboardButton("📡 Latest Signals", callback_data="signal"),
          InlineKeyboardButton("📊 Performance", callback_data="perf")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
          InlineKeyboardButton("💎 Premium", callback_data="premium")],
@@ -202,7 +206,7 @@ def back_kb(extra=None) -> InlineKeyboardMarkup:
 
 def home_text(uid: int) -> str:
     tier = "💎 Premium" if is_premium(uid) else "🆓 Free"
-    return f"🥇 <b>{BRAND}</b>\n\nXAUUSD signals on {TF}.\nYour plan: {tier}\n\nChoose an option:"
+    return f"🥇 <b>{BRAND}</b>\n\nAssets: XAUUSD, BTCUSD ({TF})\nYour plan: {tier}\n\nChoose an option:"
 
 def settings_view(uid: int):
     u = q("SELECT alerts, min_score FROM users WHERE user_id=?", (uid,), one=True)
@@ -217,12 +221,15 @@ def settings_view(uid: int):
     return text, kb
 
 def signal_view(uid: int) -> str:
-    rows = q("SELECT * FROM signals ORDER BY id DESC LIMIT 20")
+    rows = q("SELECT * FROM signals ORDER BY id DESC LIMIT 5")
     if not rows:
-        return "📡 <b>Latest Signal</b>\n\nNo signal available right now."
-    r = rows[0]
-    status = r["status"] if r["status"] != "OPEN" else (f"OPEN (TP{r['stage']} hit)" if r["stage"] else "OPEN")
-    return fmt_signal(r) + f"\n\nStatus: <b>{status}</b>"
+        return "📡 <b>Latest Signals</b>\n\nNo signals available right now."
+    
+    output = ["📡 <b>Recent Signals</b>\n"]
+    for r in rows:
+        status = r["status"] if r["status"] != "OPEN" else (f"OPEN (TP{r['stage']} hit)" if r["stage"] else "OPEN")
+        output.append(f"• <b>{r['symbol']}</b> {r['side']} @ {r['entry']:.2f} (Score: {r['score']}) — <b>{status}</b>")
+    return "\n".join(output)
 
 def premium_text(uid: int) -> str:
     until = premium_until(uid)
@@ -278,34 +285,37 @@ async def push(bot, text: str, min_score: int):
         await asyncio.sleep(0.05)
 
 async def scan(ctx: ContextTypes.DEFAULT_TYPE):
-    try:
-        feed = await asyncio.to_thread(get_candles, CFG)
-    except Exception as e:
-        log.warning("data error: %s", e)
-        STATE["error"] = str(e)
-        return
-    df = feed.df
-    STATE.update(last_scan=now_utc().strftime("%H:%M:%S UTC"), last_bar=str(df.index[-1]),
-                 error=None, spread=feed.spread, source=feed.source)
+    for symbol in SYMBOLS:
+        try:
+            feed = await asyncio.to_thread(get_candles, CFG, symbol=symbol)
+        except Exception as e:
+            log.warning("data error for %s: %s", symbol, e)
+            STATE["error"] = str(e)
+            continue
 
-    for r, kind, net in track_open(df):
-        text = fmt_event(r, kind, net)
-        if text:
-            await push(ctx.bot, text, r["score"])
+        df = feed.df
+        STATE.update(last_scan=now_utc().strftime("%H:%M:%S UTC"), last_bar=str(df.index[-1]),
+                     error=None, spread=feed.spread, source=feed.source)
 
-    if q("SELECT 1 FROM signals WHERE status='OPEN'", one=True):
-        return
-    sig = evaluate(df, CFG)
-    if not sig:
-        return
+        for r, kind, net in track_open(df, symbol):
+            text = fmt_event(r, kind, net)
+            if text:
+                await push(ctx.bot, text, r["score"])
 
-    sid = q(
-        "INSERT INTO signals(ts, created, side, entry, sl, tp1, tp2, tp3, score, atr, spread, reasons) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-        (sig.ts.isoformat(), now_utc().isoformat(), sig.side, sig.entry, sig.sl, sig.tp1, sig.tp2, sig.tp3,
-         sig.score, sig.atr, feed.spread or CFG.assumed_spread, json.dumps(sig.reasons)), commit=True)
-    log.info("New signal #%s %s @ %.2f (score %d)", sid, sig.side, sig.entry, sig.score)
-    await push(ctx.bot, fmt_signal(q("SELECT * FROM signals WHERE id=?", (sid,), one=True)), sig.score)
+        if q("SELECT 1 FROM signals WHERE symbol=? AND status='OPEN'", (symbol,), one=True):
+            continue
+
+        sig = evaluate(df, CFG)
+        if not sig:
+            continue
+
+        sid = q(
+            "INSERT INTO signals(symbol, ts, created, side, entry, sl, tp1, tp2, tp3, score, atr, spread, reasons) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (symbol, sig.ts.isoformat(), now_utc().isoformat(), sig.side, sig.entry, sig.sl, sig.tp1, sig.tp2, sig.tp3,
+             sig.score, sig.atr, feed.spread or CFG.assumed_spread, json.dumps(sig.reasons)), commit=True)
+        log.info("New %s signal #%s %s @ %.2f (score %d)", symbol, sid, sig.side, sig.entry, sig.score)
+        await push(ctx.bot, fmt_signal(q("SELECT * FROM signals WHERE id=?", (sid,), one=True)), sig.score)
 
 def main():
     init_db()
@@ -321,7 +331,7 @@ def main():
     app_tg.add_handler(CallbackQueryHandler(on_button))
     app_tg.job_queue.run_repeating(scan, interval=SCAN_SECONDS, first=5)
     
-    log.info("%s started | %s", BRAND, CFG.summary())
+    log.info("%s started for symbols: %s | %s", BRAND, SYMBOLS, CFG.summary())
     app_tg.run_polling()
 
 if __name__ == "__main__":

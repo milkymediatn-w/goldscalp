@@ -35,7 +35,7 @@ def _mt5_offset(cfg: Config, tick) -> float:
     return _last_offset
 
 
-def _fetch_mt5(cfg: Config):
+def _fetch_mt5(cfg: Config, symbol: str = "XAUUSD"):
     global _mt5_ready
     try:
         import MetaTrader5 as mt5
@@ -45,6 +45,8 @@ def _fetch_mt5(cfg: Config):
     tf_map = {1: mt5.TIMEFRAME_M1, 5: mt5.TIMEFRAME_M5, 15: mt5.TIMEFRAME_M15, 60: mt5.TIMEFRAME_H1}
     if cfg.tf_min not in tf_map:
         raise ValueError("MT5 timeframe must be 1, 5, 15 or 60 minutes")
+
+    sym = cfg.mt5_symbol if symbol.upper() == "XAUUSD" else symbol
 
     with _mt5_lock:
         if not _mt5_ready:
@@ -57,7 +59,6 @@ def _fetch_mt5(cfg: Config):
                 raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
             _mt5_ready = True
 
-        sym = cfg.mt5_symbol
         if not mt5.symbol_select(sym, True):
             raise RuntimeError(f"MT5 symbol '{sym}' not found in Market Watch.")
         rates = mt5.copy_rates_from_pos(sym, tf_map[cfg.tf_min], 0, cfg.bars)
@@ -76,17 +77,25 @@ def _fetch_mt5(cfg: Config):
     return df[["open", "high", "low", "close", "volume"]], spread
 
 
-def _fetch_twelve(cfg: Config) -> pd.DataFrame:
+def _fetch_twelve(cfg: Config, symbol: str = "XAUUSD") -> pd.DataFrame:
+    td_symbol = symbol
+    if symbol.upper() == "XAUUSD":
+        td_symbol = "XAU/USD"
+    elif symbol.upper() == "BTCUSD":
+        td_symbol = "BTC/USD"
+    elif "/" not in symbol and symbol.endswith("USD"):
+        td_symbol = symbol[:-3] + "/USD"
+
     interval = {1: "1min", 5: "5min", 15: "15min", 60: "1h"}[cfg.tf_min]
     r = httpx.get(
         "https://api.twelvedata.com/time_series",
-        params={"symbol": "XAU/USD", "interval": interval, "outputsize": min(cfg.bars, 5000),
+        params={"symbol": td_symbol, "interval": interval, "outputsize": min(cfg.bars, 5000),
                 "timezone": "UTC", "apikey": cfg.twelve_api_key},
         timeout=20,
     )
     j = r.json()
     if "values" not in j:
-        raise RuntimeError(j.get("message", "Twelve Data API error"))
+        raise RuntimeError(j.get("message", f"Twelve Data API error for {symbol}: {j}"))
     df = pd.DataFrame(j["values"])
     df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
     df = df.set_index("datetime").sort_index()
@@ -96,22 +105,23 @@ def _fetch_twelve(cfg: Config) -> pd.DataFrame:
     return df[["open", "high", "low", "close", "volume"]]
 
 
-def _fetch_yf(cfg: Config) -> pd.DataFrame:
+def _fetch_yf(cfg: Config, symbol: str = "XAUUSD") -> pd.DataFrame:
     import yfinance as yf
+    yf_sym = "GC=F" if symbol.upper() == "XAUUSD" else ("BTC-USD" if symbol.upper() == "BTCUSD" else symbol)
     interval, period = {1: ("1m", "7d"), 5: ("5m", "30d"), 15: ("15m", "30d"), 60: ("60m", "120d")}[cfg.tf_min]
-    df = yf.Ticker("GC=F").history(period=period, interval=interval, auto_adjust=False)
+    df = yf.Ticker(yf_sym).history(period=period, interval=interval, auto_adjust=False)
     return df.rename(columns=str.lower)[["open", "high", "low", "close", "volume"]]
 
 
-def get_candles(cfg: Config) -> Feed:
+def get_candles(cfg: Config, symbol: str = "XAUUSD") -> Feed:
     src = cfg.data_source.lower()
     spread = None
     if src == "mt5":
-        df, spread = _fetch_mt5(cfg)
+        df, spread = _fetch_mt5(cfg, symbol)
     elif src == "twelvedata":
-        df = _fetch_twelve(cfg)
+        df = _fetch_twelve(cfg, symbol)
     elif src == "yfinance":
-        df = _fetch_yf(cfg)
+        df = _fetch_yf(cfg, symbol)
     else:
         raise ValueError(f"Unknown DATA_SOURCE '{cfg.data_source}'")
 
