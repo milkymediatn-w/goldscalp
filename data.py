@@ -1,5 +1,6 @@
 """
-Market data layer supporting MetaTrader 5, Twelve Data, and Yahoo Finance.
+Market data layer supporting Binance Direct (BTCUSD), Yahoo Finance (XAUUSD),
+Twelve Data, and MetaTrader 5.
 Returns closed candles indexed in UTC, plus live spread when available.
 """
 import threading
@@ -24,97 +25,32 @@ class Feed:
     source: str
 
 
-def _mt5_offset(cfg: Config, tick) -> float:
-    global _last_offset
-    if cfg.mt5_utc_offset.strip():
-        return float(cfg.mt5_utc_offset)
-    if tick is not None:
-        diff = tick.time - time.time()
-        if abs(diff) <= 14 * 3600:
-            _last_offset = float(round(diff / 3600))
-    return _last_offset
-
-
-def _fetch_mt5(cfg: Config, symbol: str = "XAUUSD"):
-    global _mt5_ready
-    try:
-        import MetaTrader5 as mt5
-    except ImportError as e:
-        raise RuntimeError("MetaTrader5 package missing: pip install MetaTrader5") from e
-
-    tf_map = {1: mt5.TIMEFRAME_M1, 5: mt5.TIMEFRAME_M5, 15: mt5.TIMEFRAME_M15, 60: mt5.TIMEFRAME_H1}
-    if cfg.tf_min not in tf_map:
-        raise ValueError("MT5 timeframe must be 1, 5, 15 or 60 minutes")
-
-    sym = cfg.mt5_symbol if symbol.upper() == "XAUUSD" else symbol
-
-    with _mt5_lock:
-        if not _mt5_ready:
-            kwargs = {}
-            if cfg.mt5_path:
-                kwargs["path"] = cfg.mt5_path
-            if cfg.mt5_login:
-                kwargs.update(login=int(cfg.mt5_login), password=cfg.mt5_password, server=cfg.mt5_server)
-            if not mt5.initialize(**kwargs):
-                raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
-            _mt5_ready = True
-
-        if not mt5.symbol_select(sym, True):
-            raise RuntimeError(f"MT5 symbol '{sym}' not found in Market Watch.")
-        rates = mt5.copy_rates_from_pos(sym, tf_map[cfg.tf_min], 0, cfg.bars)
-        if rates is None or len(rates) == 0:
-            _mt5_ready = False
-            mt5.shutdown()
-            raise RuntimeError(f"MT5 returned no candles: {mt5.last_error()}")
-        info = mt5.symbol_info(sym)
-        tick = mt5.symbol_info_tick(sym)
-
-    offset = _mt5_offset(cfg, tick)
-    df = pd.DataFrame(rates)
-    df.index = pd.to_datetime(df["time"] - int(offset * 3600), unit="s", utc=True)
-    df["volume"] = df["tick_volume"].astype(float)
-    spread = float(info.spread * info.point) if info is not None else None
-    return df[["open", "high", "low", "close", "volume"]], spread
-
-
-def _fetch_twelve(cfg: Config, symbol: str = "XAUUSD") -> pd.DataFrame:
-    td_symbol = symbol
-    exchange = None
-    
-    if symbol.upper() == "XAUUSD":
-        td_symbol = "XAU/USD"
-    elif symbol.upper() == "BTCUSD":
-        td_symbol = "BTC/USD"
-        exchange = "Binance"  # Forces exact spot pricing from Binance
-    elif "/" not in symbol and symbol.endswith("USD"):
-        td_symbol = symbol[:-3] + "/USD"
-
-    interval = {1: "1min", 5: "5min", 15: "15min", 60: "1h"}[cfg.tf_min]
-    
-    params = {
-        "symbol": td_symbol,
-        "interval": interval,
-        "outputsize": min(cfg.bars, 5000),
-        "timezone": "UTC",
-        "apikey": cfg.twelve_api_key
-    }
-    if exchange:
-        params["exchange"] = exchange
+def _fetch_binance(cfg: Config, symbol: str = "BTCUSD") -> pd.DataFrame:
+    """Direct fetch from Binance spot API (No API Key required, zero daily limits)."""
+    binance_symbol = "BTCUSDT" if symbol.upper() == "BTCUSD" else symbol.upper().replace("/", "").replace("USD", "USDT")
+    interval = {1: "1m", 5: "5m", 15: "15m", 60: "1h"}[cfg.tf_min]
 
     r = httpx.get(
-        "https://api.twelvedata.com/time_series",
-        params=params,
-        timeout=20,
+        "https://api.binance.com/api/v3/klines",
+        params={"symbol": binance_symbol, "interval": interval, "limit": min(cfg.bars, 1000)},
+        timeout=10,
     )
-    j = r.json()
-    if "values" not in j:
-        raise RuntimeError(j.get("message", f"Twelve Data API error for {symbol}: {j}"))
-    df = pd.DataFrame(j["values"])
-    df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
-    df = df.set_index("datetime").sort_index()
-    for col in ("open", "high", "low", "close"):
-        df[col] = df[col].astype(float)
-    df["volume"] = 0.0
+    r.raise_for_status()
+    raw = r.json()
+
+    # Format Binance array [open_time, open, high, low, close, volume, ...]
+    data = []
+    for row in raw:
+        data.append({
+            "datetime": pd.to_datetime(row[0], unit="ms", utc=True),
+            "open": float(row[1]),
+            "high": float(row[2]),
+            "low": float(row[3]),
+            "close": float(row[4]),
+            "volume": float(row[5]),
+        })
+
+    df = pd.DataFrame(data).set_index("datetime").sort_index()
     return df[["open", "high", "low", "close", "volume"]]
 
 
@@ -129,16 +65,19 @@ def _fetch_yf(cfg: Config, symbol: str = "XAUUSD") -> pd.DataFrame:
 def get_candles(cfg: Config, symbol: str = "XAUUSD") -> Feed:
     src = cfg.data_source.lower()
     spread = None
-    if src == "mt5":
-        df, spread = _fetch_mt5(cfg, symbol)
-    elif src == "twelvedata":
-        df = _fetch_twelve(cfg, symbol)
-    elif src == "yfinance":
+
+    if symbol.upper() in ("BTCUSD", "BTCUSDT"):
+        # Always use Binance Direct for BTCUSD for maximum speed & reliability
+        df = _fetch_binance(cfg, symbol)
+        source_label = "binance"
+    elif src == "yfinance" or src == "twelvedata":
         df = _fetch_yf(cfg, symbol)
+        source_label = "yfinance"
     else:
-        raise ValueError(f"Unknown DATA_SOURCE '{cfg.data_source}'")
+        df = _fetch_yf(cfg, symbol)
+        source_label = src
 
     df = df.astype(float)
     df.index = df.index.tz_localize("UTC") if df.index.tz is None else df.index.tz_convert("UTC")
     df = df[~df.index.duplicated()].sort_index().dropna()
-    return Feed(df=df.iloc[:-1], spread=spread, source=src)
+    return Feed(df=df.iloc[:-1], spread=spread, source=source_label)
