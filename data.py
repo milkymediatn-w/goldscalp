@@ -1,6 +1,5 @@
 """
-Market data layer supporting Binance Direct (BTCUSD), Yahoo Finance (XAUUSD),
-Twelve Data, and MetaTrader 5.
+Market data layer supporting Coinbase Spot (BTCUSD) and Yahoo Finance Spot (XAUUSD).
 Returns closed candles indexed in UTC, plus live spread when available.
 """
 import threading
@@ -25,27 +24,27 @@ class Feed:
     source: str
 
 
-def _fetch_binance(cfg: Config, symbol: str = "BTCUSD") -> pd.DataFrame:
-    """Direct fetch from Binance spot API (No API Key required, zero daily limits)."""
-    binance_symbol = "BTCUSDT" if symbol.upper() == "BTCUSD" else symbol.upper().replace("/", "").replace("USD", "USDT")
-    interval = {1: "1m", 5: "5m", 15: "15m", 60: "1h"}[cfg.tf_min]
+def _fetch_coinbase(cfg: Config, symbol: str = "BTCUSD") -> pd.DataFrame:
+    """Direct fetch from Coinbase Spot API (Pure USD Spot, No API Key required)."""
+    cb_symbol = "BTC-USD" if symbol.upper() in ("BTCUSD", "BTCUSDT") else symbol.upper()
+    granularity = {1: 60, 5: 300, 15: 900, 60: 3600}[cfg.tf_min]
 
     r = httpx.get(
-        "https://api.binance.com/api/v3/klines",
-        params={"symbol": binance_symbol, "interval": interval, "limit": min(cfg.bars, 1000)},
+        f"https://api.exchange.coinbase.com/products/{cb_symbol}/candles",
+        params={"granularity": granularity},
         timeout=10,
     )
     r.raise_for_status()
     raw = r.json()
 
-    # Format Binance array [open_time, open, high, low, close, volume, ...]
+    # Format Coinbase array [time, low, high, open, close, volume]
     data = []
     for row in raw:
         data.append({
-            "datetime": pd.to_datetime(row[0], unit="ms", utc=True),
-            "open": float(row[1]),
+            "datetime": pd.to_datetime(row[0], unit="s", utc=True),
+            "open": float(row[3]),
             "high": float(row[2]),
-            "low": float(row[3]),
+            "low": float(row[1]),
             "close": float(row[4]),
             "volume": float(row[5]),
         })
@@ -56,7 +55,7 @@ def _fetch_binance(cfg: Config, symbol: str = "BTCUSD") -> pd.DataFrame:
 
 def _fetch_yf(cfg: Config, symbol: str = "XAUUSD") -> pd.DataFrame:
     import yfinance as yf
-    yf_sym = "GC=F" if symbol.upper() == "XAUUSD" else ("BTC-USD" if symbol.upper() == "BTCUSD" else symbol)
+    yf_sym = "XAU=X" if symbol.upper() in ("XAUUSD", "GOLD") else symbol
     interval, period = {1: ("1m", "7d"), 5: ("5m", "30d"), 15: ("15m", "30d"), 60: ("60m", "120d")}[cfg.tf_min]
     df = yf.Ticker(yf_sym).history(period=period, interval=interval, auto_adjust=False)
     return df.rename(columns=str.lower)[["open", "high", "low", "close", "volume"]]
@@ -67,12 +66,11 @@ def get_candles(cfg: Config, symbol: str = "XAUUSD") -> Feed:
     spread = None
 
     if symbol.upper() in ("BTCUSD", "BTCUSDT"):
-        # Always use Binance Direct for BTCUSD for maximum speed & reliability
-        df = _fetch_binance(cfg, symbol)
-        source_label = "binance"
-    elif src == "yfinance" or src == "twelvedata":
-        df = _fetch_yf(cfg, symbol)
-        source_label = "yfinance"
+        df = _fetch_coinbase(cfg, "BTCUSD")
+        source_label = "coinbase-spot"
+    elif symbol.upper() in ("XAUUSD", "GOLD"):
+        df = _fetch_yf(cfg, "XAUUSD")
+        source_label = "yfinance-spot"
     else:
         df = _fetch_yf(cfg, symbol)
         source_label = src
