@@ -1,5 +1,5 @@
 """
-Market data layer supporting Coinbase Spot (BTCUSD) and Yahoo Finance Spot (XAUUSD).
+Market data layer supporting Coinbase Direct Spot (BTCUSD) and Yahoo Finance (XAUUSD).
 Returns closed candles indexed in UTC, plus live spread when available.
 """
 import threading
@@ -55,9 +55,14 @@ def _fetch_coinbase(cfg: Config, symbol: str = "BTCUSD") -> pd.DataFrame:
 
 def _fetch_yf(cfg: Config, symbol: str = "XAUUSD") -> pd.DataFrame:
     import yfinance as yf
-    yf_sym = "XAU=X" if symbol.upper() in ("XAUUSD", "GOLD") else symbol
+    # Valid active ticker for Gold on Yahoo Finance
+    yf_sym = "GC=F" if symbol.upper() in ("XAUUSD", "GOLD") else symbol
     interval, period = {1: ("1m", "7d"), 5: ("5m", "30d"), 15: ("15m", "30d"), 60: ("60m", "120d")}[cfg.tf_min]
     df = yf.Ticker(yf_sym).history(period=period, interval=interval, auto_adjust=False)
+    
+    if df.empty:
+        raise RuntimeError(f"No market candles returned for symbol {yf_sym}")
+        
     return df.rename(columns=str.lower)[["open", "high", "low", "close", "volume"]]
 
 
@@ -70,12 +75,19 @@ def get_candles(cfg: Config, symbol: str = "XAUUSD") -> Feed:
         source_label = "coinbase-spot"
     elif symbol.upper() in ("XAUUSD", "GOLD"):
         df = _fetch_yf(cfg, "XAUUSD")
-        source_label = "yfinance-spot"
+        source_label = "yfinance-gold"
     else:
         df = _fetch_yf(cfg, symbol)
         source_label = src
 
+    if df.empty:
+        raise RuntimeError(f"Candle data for {symbol} is empty.")
+
     df = df.astype(float)
-    df.index = df.index.tz_localize("UTC") if df.index.tz is None else df.index.tz_convert("UTC")
+    if hasattr(df.index, "tz") and df.index.tz is not None:
+        df.index = df.index.tz_convert("UTC")
+    else:
+        df.index = df.index.tz_localize("UTC")
+
     df = df[~df.index.duplicated()].sort_index().dropna()
     return Feed(df=df.iloc[:-1], spread=spread, source=source_label)
