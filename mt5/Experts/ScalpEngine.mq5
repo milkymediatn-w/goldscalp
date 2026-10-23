@@ -1,29 +1,32 @@
 //+------------------------------------------------------------------+
-//| ScalpEngine.mq5                                                  |
-//| 1-minute order-flow scalper: trade the candle, tight stop,       |
-//| break-even + ATR trailing stop, no take-profit.                  |
+//| ScalpEngine.mq5  v2                                              |
+//| Candle scalper for CFD quote feeds (built around Exness BTCUSDm):|
+//| enter early in a candle, tight stop, break-even + ATR trailing   |
+//| stop, out at the candle close. No take-profit.                   |
 //|                                                                  |
-//| Signals come from tick flow (aggressor flags when the broker     |
-//| sends them, otherwise the tick rule on bid/ask), tick speed,     |
-//| N-bar range breaks / sweeps, an optional M5 trend filter and     |
-//| an optional depth-of-market imbalance (only used when the        |
-//| broker actually publishes a book).                               |
+//| Setups                                                           |
+//|  breakout : price leaves the N-bar range with flow and tick speed|
+//|  impulse  : continuation after a strong, full-bodied candle      |
+//|  sweep    : price runs the range stops, comes back, flow flips   |
 //|                                                                  |
-//| Every closed trade is written to MQL5/Files/ScalpEngine_*.csv    |
-//| for analysis with mt5/analyze_trades.py.                         |
+//| Flow = tick-rule imbalance (direction of each quote change), or  |
+//| real aggressor flags when the feed has them. A depth-of-market   |
+//| imbalance is used only when the broker publishes a book.         |
+//|                                                                  |
+//| Every closed trade goes to MQL5/Files/ScalpEngine_<symbol>.csv;  |
+//| a skip-reason report is printed when the EA stops.               |
 //+------------------------------------------------------------------+
 #property copyright "goldscalp"
-#property version   "1.00"
-#property description "1m order-flow scalper (trade the candle, trailing stop, no TP)"
+#property version   "2.00"
+#property description "Candle scalper: trade the candle, tight stop, trailing stop, no TP"
 
 #include <Trade/Trade.mqh>
 
-enum ENUM_SIGNAL_MODE
-  {
-   MODE_BREAKOUT   = 0,   // Breakout with flow
-   MODE_SWEEP_FADE = 1,   // Sweep and reclaim (fade)
-   MODE_BOTH       = 2    // Both
-  };
+//--- timeframe
+input group "Timeframe"
+input ENUM_TIMEFRAMES InpTF       = PERIOD_M3;  // Candle to trade (M1..M15)
+input ENUM_TIMEFRAMES InpHtfTF    = PERIOD_M15; // Trend filter timeframe
+input int    InpHtfEma            = 50;     // Trend filter EMA period (0 = off)
 
 //--- risk
 input group "Risk"
@@ -31,36 +34,41 @@ input double InpRiskPercent       = 0.25;   // Risk per trade, % of equity (0 = 
 input double InpFixedLots         = 0.01;   // Fixed lots when risk % is 0
 input double InpMaxLots           = 1.0;    // Hard cap on lots
 input bool   InpAllowMinLot       = true;   // Use min lot if it risks <= 1.5x target
-input double InpMaxDailyLossPct   = 2.0;    // Stop for the day after this equity drawdown %
-input int    InpMaxTradesPerDay   = 60;     // Max entries per server day
+input double InpMaxDailyLossPct   = 3.0;    // Stop for the day after this equity drawdown %
+input int    InpMaxTradesPerDay   = 40;     // Max entries per server day
 input int    InpMaxConsecLosses   = 4;      // Pause after this many losses in a row
 input int    InpLossPauseMin      = 30;     // Pause length, minutes
 input long   InpMagic             = 260424; // Magic number
-input int    InpDeviationPts      = 50;     // Max slippage, points
+input int    InpDeviationPts      = 300;    // Max slippage, points (BTCUSDm: 100 pts = $1)
 
-//--- cost filters
-input group "Cost filters"
+//--- filters
+input group "Cost and regime filters"
 input int    InpMaxSpreadPts      = 0;      // Max spread, points (0 = off)
-input double InpMinAtrToSpread    = 4.0;    // 1m ATR must be >= this x spread
+input double InpMinAtrToSpread    = 3.0;    // ATR of the traded candle must be >= this x spread
+input double InpMaxAtrSpikeX      = 3.0;    // Skip when ATR(14) > this x ATR(100): news spikes
+input double InpMinTickRate       = 0.2;    // Skip when the feed is slower than this, ticks/s (10-min avg)
 
-//--- signal
-input group "Signal"
-input ENUM_SIGNAL_MODE InpMode    = MODE_BOTH; // Setup(s) to trade
-input int    InpRangeBars         = 5;      // Range = high/low of last N closed 1m bars
-input int    InpEntryWindowSec    = 30;     // Enter only in the first N seconds of a bar
-input int    InpFlowWindowSec     = 20;     // Tick-flow window, seconds (5..120)
-input double InpMinFlowImb        = 0.25;   // Min tick-flow imbalance (0..1)
-input double InpMinTickRateX      = 1.5;    // Breakout: tick speed >= this x 10-min average
-input double InpMaxChaseAtr       = 0.5;    // Breakout: skip if price is this many ATR past the range
-input int    InpAtrPeriod         = 14;     // ATR period (M1)
-input int    InpHtfEma            = 50;     // M5 EMA trend filter period (0 = off)
-input bool   InpHtfFilterFades    = false;  // Also apply the trend filter to sweep fades
+//--- setups
+input group "Setups"
+input bool   InpUseBreakout       = true;   // Breakout of the N-bar range
+input bool   InpUseImpulse        = true;   // Continuation after a strong candle
+input bool   InpUseSweep          = true;   // Sweep of the range and reclaim (fade)
+input int    InpRangeBars         = 5;      // Range = high/low of the last N closed candles
+input int    InpEntryWindowPct    = 35;     // Enter only in the first N% of the candle
+input int    InpFlowWindowSec     = 30;     // Tick-flow window, seconds (5..120)
+input double InpMinFlowImb        = 0.25;   // Min flow imbalance, 0..1
+input double InpMinTickRateX      = 1.3;    // Breakout: tick speed >= this x 10-min average
+input double InpMaxChaseAtr       = 0.4;    // Skip if price already ran this many ATR past the trigger
+input double InpImpulseAtr        = 1.2;    // Impulse candle range >= this x ATR
+input double InpImpulseBody       = 0.6;    // Impulse candle body >= this x its range
+input int    InpAtrPeriod         = 14;     // ATR period
+input bool   InpHtfFilterFades    = false;  // Apply the trend filter to sweep fades too
 
 //--- depth of market
 input group "Depth of market"
 input bool   InpUseBook           = true;   // Use DOM imbalance when the broker sends a book
 input int    InpBookLevels        = 5;      // Levels per side
-input double InpMinBookImb        = 0.10;   // Book must agree by at least this (0..1)
+input double InpMinBookImb        = 0.10;   // Book must agree by at least this, 0..1
 
 //--- exits
 input group "Exits"
@@ -68,16 +76,18 @@ input double InpSlAtr             = 0.6;    // Initial stop, x ATR
 input double InpSlMinSpreads      = 3.0;    // Stop at least this many spreads
 input double InpBreakEvenR        = 0.5;    // Move stop to entry at +R (0 = off)
 input double InpTrailStartR       = 0.8;    // Start trailing at +R (0 = off)
-input double InpTrailAtr          = 0.4;    // Trail distance, x ATR
+input double InpTrailAtr          = 0.5;    // Trail distance, x ATR
 input double InpTrailStepAtr      = 0.05;   // Min stop improvement per modify, x ATR
-input int    InpMaxHoldBars       = 1;      // Close after this many bars (1 = this candle)
-input int    InpExitSecBeforeClose= 0;      // Close this many seconds before the bar ends
+input int    InpMaxHoldBars       = 1;      // Close after this many candles (1 = this candle)
+input int    InpExitSecBeforeClose= 0;      // Close this many seconds before the candle ends
 
-//--- sessions (server time; Exness server time is UTC)
-input group "Session"
-input int    InpSessionStartHour  = 0;      // Start hour (server time)
-input int    InpSessionEndHour    = 24;     // End hour (server time, exclusive)
+//--- session
+input group "Session (server time, Exness = UTC)"
+input int    InpSessionStartHour  = 0;      // Start hour
+input int    InpSessionEndHour    = 24;     // End hour (exclusive)
+input bool   InpTradeWeekends     = true;   // Trade Saturday and Sunday
 input bool   InpLogTrades         = true;   // Write closed trades to CSV
+input bool   InpVerbose           = true;   // Print every entry and exit
 
 //--- tick-flow ring buffer: one bucket per second
 #define RING 900
@@ -96,9 +106,13 @@ double   g_bookImb        = 0.0;
 int      g_bookLevels     = 0;
 datetime g_bookTime       = 0;
 
-//--- indicators
-int g_atrHandle = INVALID_HANDLE;
-int g_emaHandle = INVALID_HANDLE;
+//--- indicators and timeframe
+ENUM_TIMEFRAMES g_tf;
+int g_barSec        = 60;
+int g_entryWinSec   = 20;
+int g_atrHandle     = INVALID_HANDLE;
+int g_atrSlowHandle = INVALID_HANDLE;
+int g_emaHandle     = INVALID_HANDLE;
 
 //--- state
 CTrade   trade;
@@ -110,8 +124,9 @@ int      g_tradesToday    = 0;
 int      g_consecLosses   = 0;
 datetime g_pauseUntil     = 0;
 string   g_status         = "";
+datetime g_lastCloseTry   = 0;
 
-//--- diagnostics: why bars were skipped (each reason counted once per bar)
+//--- diagnostics: why candles were skipped (each reason counted once per candle)
 #define SKIP_HALTED   0
 #define SKIP_PAUSED   1
 #define SKIP_MAXDAY   2
@@ -119,23 +134,28 @@ string   g_status         = "";
 #define SKIP_SESSION  4
 #define SKIP_SPREAD   5
 #define SKIP_ATR      6
-#define SKIP_NOSIGNAL 7
-#define SKIP_MINLOT   8
-#define SKIP_FAILED   9
-#define SKIP_NODATA   10
-#define SKIP_COUNT    11
+#define SKIP_SPIKE    7
+#define SKIP_DEADFEED 8
+#define SKIP_NOSIGNAL 9
+#define SKIP_MINLOT   10
+#define SKIP_FAILED   11
+#define SKIP_NODATA   12
+#define SKIP_COUNT    13
 string   g_skipName[SKIP_COUNT] = {"daily loss limit", "losing-streak pause", "max trades per day",
                                    "algo trading disabled", "outside session", "spread above max",
-                                   "ATR < min x spread", "no setup", "min lot risks too much",
-                                   "order rejected", "no ATR/bar data"};
+                                   "ATR < min x spread", "volatility spike", "slow feed",
+                                   "no setup", "min lot risks too much", "order rejected",
+                                   "no ATR/bar data"};
 int      g_skipBars[SKIP_COUNT];
 datetime g_skipLastBar[SKIP_COUNT];
 int      g_barsSeen      = 0;
 datetime g_lastSeenBar   = 0;
 double   g_ratioSum      = 0.0;
 int      g_ratioN        = 0;
-datetime g_lastRatioBar   = 0;
+datetime g_lastRatioBar  = 0;
 int      g_entries       = 0;
+int      g_wins          = 0;
+double   g_sumR          = 0.0;
 bool     g_minLotWarned  = false;
 
 //--- context of the open trade (for logging and R maths)
@@ -166,19 +186,25 @@ int OnInit()
    ArrayInitialize(g_skipBars, 0);
    ArrayInitialize(g_skipLastBar, 0);
 
+   g_tf     = InpTF == PERIOD_CURRENT ? (ENUM_TIMEFRAMES)_Period : InpTF;
+   g_barSec = PeriodSeconds(g_tf);
+   if(g_barSec < 60 || g_barSec > 900 || 86400 % g_barSec != 0)
+     { Print("InpTF must be between M1 and M15"); return INIT_PARAMETERS_INCORRECT; }
    if(InpFlowWindowSec < 5 || InpFlowWindowSec > 120)
      { Print("InpFlowWindowSec must be within 5..120"); return INIT_PARAMETERS_INCORRECT; }
-   if(InpMaxHoldBars < 1)
-     { Print("InpMaxHoldBars must be >= 1"); return INIT_PARAMETERS_INCORRECT; }
+   if(InpMaxHoldBars < 1 || InpEntryWindowPct < 5 || InpEntryWindowPct > 90)
+     { Print("InpMaxHoldBars must be >= 1 and InpEntryWindowPct within 5..90"); return INIT_PARAMETERS_INCORRECT; }
+   g_entryWinSec = g_barSec * InpEntryWindowPct / 100;
 
-   g_atrHandle = iATR(_Symbol, PERIOD_M1, InpAtrPeriod);
-   if(g_atrHandle == INVALID_HANDLE)
+   g_atrHandle     = iATR(_Symbol, g_tf, InpAtrPeriod);
+   g_atrSlowHandle = iATR(_Symbol, g_tf, 100);
+   if(g_atrHandle == INVALID_HANDLE || g_atrSlowHandle == INVALID_HANDLE)
      { Print("Cannot create ATR"); return INIT_FAILED; }
    if(InpHtfEma > 0)
      {
-      g_emaHandle = iMA(_Symbol, PERIOD_M5, InpHtfEma, 0, MODE_EMA, PRICE_CLOSE);
+      g_emaHandle = iMA(_Symbol, InpHtfTF, InpHtfEma, 0, MODE_EMA, PRICE_CLOSE);
       if(g_emaHandle == INVALID_HANDLE)
-        { Print("Cannot create M5 EMA"); return INIT_FAILED; }
+        { Print("Cannot create trend EMA"); return INIT_FAILED; }
      }
 
    trade.SetExpertMagicNumber(InpMagic);
@@ -195,8 +221,10 @@ int OnInit()
    PullTicks();
    RecoverPosition();
    EventSetTimer(1);
-   PrintFormat("ScalpEngine on %s | risk %.2f%% | stop %.2fxATR | trail %.2fxATR from %.1fR | hold %d bar(s)",
-               _Symbol, InpRiskPercent, InpSlAtr, InpTrailAtr, InpTrailStartR, InpMaxHoldBars);
+   PrintFormat("ScalpEngine v2 on %s %s | entry window %ds | risk %.2f%% | stop %.2fxATR (min %.1f spreads) | "
+               "BE %.1fR | trail %.2fxATR from %.1fR | hold %d candle(s)",
+               _Symbol, EnumToString(g_tf), g_entryWinSec, InpRiskPercent, InpSlAtr, InpSlMinSpreads,
+               InpBreakEvenR, InpTrailAtr, InpTrailStartR, InpMaxHoldBars);
    return INIT_SUCCEEDED;
   }
 
@@ -209,6 +237,8 @@ void OnDeinit(const int reason)
       MarketBookRelease(_Symbol);
    if(g_atrHandle != INVALID_HANDLE)
       IndicatorRelease(g_atrHandle);
+   if(g_atrSlowHandle != INVALID_HANDLE)
+      IndicatorRelease(g_atrSlowHandle);
    if(g_emaHandle != INVALID_HANDLE)
       IndicatorRelease(g_emaHandle);
    Comment("");
@@ -226,7 +256,7 @@ void OnTick()
 //+------------------------------------------------------------------+
 void OnTimer()
   {
-   // Exits must fire at the bar boundary even if no tick arrives.
+   // Exits must fire at the candle close even if no tick arrives.
    DayCheck();
    ManagePosition();
    if(!MQLInfoInteger(MQL_TESTER))
@@ -384,29 +414,42 @@ bool BookLive()
    return InpUseBook && g_bookLevels > 0 && TimeCurrent() - g_bookTime <= 5;
   }
 
+bool BookAgrees(int dir)
+  {
+   if(!BookLive())
+      return true;
+   return dir > 0 ? g_bookImb >= InpMinBookImb : g_bookImb <= -InpMinBookImb;
+  }
+
 //+------------------------------------------------------------------+
 //| Helpers                                                          |
 //+------------------------------------------------------------------+
-double Atr()
+double BufferValue(int handle, int shift)
   {
    double v[];
-   if(CopyBuffer(g_atrHandle, 0, 1, 1, v) != 1)
+   if(handle == INVALID_HANDLE || CopyBuffer(handle, 0, shift, 1, v) != 1)
       return 0.0;
    return v[0];
   }
+
+double Atr()     { return BufferValue(g_atrHandle, 1); }
+double AtrSlow() { return BufferValue(g_atrSlowHandle, 1); }
 
 // +1 = only longs, -1 = only shorts, 0 = filter off or no data
 int HtfDir()
   {
    if(g_emaHandle == INVALID_HANDLE)
       return 0;
-   double ema[];
-   if(CopyBuffer(g_emaHandle, 0, 1, 1, ema) != 1)
+   double ema   = BufferValue(g_emaHandle, 1);
+   double close = iClose(_Symbol, InpHtfTF, 1);
+   if(ema <= 0.0 || close <= 0.0)
       return 0;
-   double close = iClose(_Symbol, PERIOD_M5, 1);
-   if(close <= 0.0)
-      return 0;
-   return close > ema[0] ? 1 : -1;
+   return close > ema ? 1 : -1;
+  }
+
+datetime BarStart(datetime t)
+  {
+   return (datetime)((long)t - (long)t % g_barSec);
   }
 
 double NormPrice(double p)
@@ -476,6 +519,10 @@ bool SelectOurPosition()
 
 void CloseOurPosition(const string why)
   {
+   // OnTick and OnTimer both call this: one attempt per server second is enough.
+   if(TimeCurrent() == g_lastCloseTry)
+      return;
+   g_lastCloseTry = TimeCurrent();
    if(!SelectOurPosition())
       return;
    ulong t = (ulong)PositionGetInteger(POSITION_TICKET);
@@ -528,7 +575,7 @@ void DayCheck()
 void Skip(int reason, const string status)
   {
    g_status = status;
-   datetime bar = iTime(_Symbol, PERIOD_M1, 0);
+   datetime bar = iTime(_Symbol, g_tf, 0);
    if(g_skipLastBar[reason] != bar)
      {
       g_skipLastBar[reason] = bar;
@@ -538,12 +585,14 @@ void Skip(int reason, const string status)
 
 void PrintSkipReport()
   {
-   PrintFormat("=== ScalpEngine report: %d bars inside the entry window, %d entries ===", g_barsSeen, g_entries);
+   PrintFormat("=== ScalpEngine report: %d candles inside the entry window, %d entries, %d wins, %+.2f R total ===",
+               g_barsSeen, g_entries, g_wins, g_sumR);
    if(g_ratioN > 0)
-      PrintFormat("Average 1m ATR / spread: %.2f (filter needs >= %.1f)", g_ratioSum / g_ratioN, InpMinAtrToSpread);
+      PrintFormat("Average ATR / spread on %s: %.2f (filter needs >= %.1f)",
+                  EnumToString(g_tf), g_ratioSum / g_ratioN, InpMinAtrToSpread);
    for(int r = 0; r < SKIP_COUNT; r++)
       if(g_skipBars[r] > 0)
-         PrintFormat("  skipped by %-24s on %6d bars (%.1f%%)", g_skipName[r], g_skipBars[r],
+         PrintFormat("  skipped by %-24s on %6d candles (%.1f%%)", g_skipName[r], g_skipBars[r],
                      g_barsSeen > 0 ? 100.0 * g_skipBars[r] / g_barsSeen : 0.0);
   }
 
@@ -554,11 +603,11 @@ void TryEntry()
   {
    if(SelectOurPosition())                     { g_status = "in position"; return; }
 
-   datetime bar = iTime(_Symbol, PERIOD_M1, 0);
+   datetime bar = iTime(_Symbol, g_tf, 0);
    if(bar == 0 || bar == g_lastEntryBar)
       return;
    datetime now = TimeCurrent();
-   if(now - bar > InpEntryWindowSec)           { g_status = "waiting for next bar"; return; }
+   if(now - bar > g_entryWinSec)               { g_status = "waiting for the next candle"; return; }
    if(bar != g_lastSeenBar)
      {
       g_lastSeenBar = bar;
@@ -566,21 +615,23 @@ void TryEntry()
      }
 
    if(g_haltDay)                               { Skip(SKIP_HALTED, "halted: daily loss limit"); return; }
-   if(TimeCurrent() < g_pauseUntil)            { Skip(SKIP_PAUSED, "paused after losing streak"); return; }
+   if(now < g_pauseUntil)                      { Skip(SKIP_PAUSED, "paused after losing streak"); return; }
    if(g_tradesToday >= InpMaxTradesPerDay)     { Skip(SKIP_MAXDAY, "max trades for today"); return; }
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
                                                { Skip(SKIP_ALGO, "algo trading disabled"); return; }
 
    MqlDateTime dt;
    TimeToStruct(now, dt);
-   if(dt.hour < InpSessionStartHour || dt.hour >= InpSessionEndHour)
+   bool weekend = dt.day_of_week == 0 || dt.day_of_week == 6;
+   if(dt.hour < InpSessionStartHour || dt.hour >= InpSessionEndHour || (weekend && !InpTradeWeekends))
                                                { Skip(SKIP_SESSION, "outside session"); return; }
 
    MqlTick tk;
    if(!SymbolInfoTick(_Symbol, tk) || tk.bid <= 0.0 || tk.ask <= 0.0)
       return;
-   double spread = tk.ask - tk.bid;
-   double atr    = Atr();
+   double spread  = tk.ask - tk.bid;
+   double atr     = Atr();
+   double atrSlow = AtrSlow();
    if(atr <= 0.0)                              { Skip(SKIP_NODATA, "waiting for ATR data"); return; }
    if(spread > 0.0 && bar != g_lastRatioBar)
      {
@@ -591,55 +642,74 @@ void TryEntry()
    if(InpMaxSpreadPts > 0 && spread > InpMaxSpreadPts * _Point)
                                                { Skip(SKIP_SPREAD, "spread too wide"); return; }
    if(atr < InpMinAtrToSpread * spread)        { Skip(SKIP_ATR, "range too small for the spread"); return; }
-
-   int idxH = iHighest(_Symbol, PERIOD_M1, MODE_HIGH, InpRangeBars, 1);
-   int idxL = iLowest(_Symbol, PERIOD_M1, MODE_LOW, InpRangeBars, 1);
-   if(idxH < 0 || idxL < 0)                    { Skip(SKIP_NODATA, "waiting for bar data"); return; }
-   double rangeHigh = iHigh(_Symbol, PERIOD_M1, idxH);
-   double rangeLow  = iLow(_Symbol, PERIOD_M1, idxL);
-   double barHigh   = iHigh(_Symbol, PERIOD_M1, 0);
-   double barLow    = iLow(_Symbol, PERIOD_M1, 0);
+   if(InpMaxAtrSpikeX > 0.0 && atrSlow > 0.0 && atr > InpMaxAtrSpikeX * atrSlow)
+                                               { Skip(SKIP_SPIKE, "volatility spike"); return; }
 
    double imb, rate, baseRate;
    FlowStats(imb, rate, baseRate);
+   if(baseRate < InpMinTickRate)               { Skip(SKIP_DEADFEED, "feed too slow"); return; }
    double rateX = baseRate > 0.0 ? rate / baseRate : 0.0;
-   bool   book  = BookLive();
    int    htf   = HtfDir();
+
+   int idxH = iHighest(_Symbol, g_tf, MODE_HIGH, InpRangeBars, 1);
+   int idxL = iLowest(_Symbol, g_tf, MODE_LOW, InpRangeBars, 1);
+   if(idxH < 0 || idxL < 0)                    { Skip(SKIP_NODATA, "waiting for bar data"); return; }
+   double rangeHigh = iHigh(_Symbol, g_tf, idxH);
+   double rangeLow  = iLow(_Symbol, g_tf, idxL);
+   double barHigh   = iHigh(_Symbol, g_tf, 0);
+   double barLow    = iLow(_Symbol, g_tf, 0);
+   double o1 = iOpen(_Symbol, g_tf, 1), h1 = iHigh(_Symbol, g_tf, 1);
+   double l1 = iLow(_Symbol, g_tf, 1),  c1 = iClose(_Symbol, g_tf, 1);
+   double chase = InpMaxChaseAtr * atr;
 
    int    dir   = 0;
    string setup = "";
 
-   if(InpMode != MODE_SWEEP_FADE)
+   // 1. Breakout: price leaves the range with flow and a burst of ticks.
+   if(InpUseBreakout && rateX >= InpMinTickRateX)
      {
-      bool fast = rateX >= InpMinTickRateX;
-      if(tk.bid > rangeHigh && tk.bid - rangeHigh <= InpMaxChaseAtr * atr && imb >= InpMinFlowImb && fast &&
-         (!book || g_bookImb >= InpMinBookImb) && htf >= 0)
+      if(tk.bid > rangeHigh && tk.bid - rangeHigh <= chase && imb >= InpMinFlowImb && htf >= 0 && BookAgrees(1))
         { dir = 1; setup = "breakout"; }
       else
-         if(tk.bid < rangeLow && rangeLow - tk.bid <= InpMaxChaseAtr * atr && imb <= -InpMinFlowImb && fast &&
-            (!book || g_bookImb <= -InpMinBookImb) && htf <= 0)
+         if(tk.bid < rangeLow && rangeLow - tk.bid <= chase && imb <= -InpMinFlowImb && htf <= 0 && BookAgrees(-1))
            { dir = -1; setup = "breakout"; }
      }
-   if(dir == 0 && InpMode != MODE_BREAKOUT)
+
+   // 2. Impulse: the last candle was big and full-bodied, flow still pushes the same way,
+   //    and price holds the upper (lower) half of that candle without having run away.
+   double rng1 = h1 - l1;
+   if(dir == 0 && InpUseImpulse && rng1 >= InpImpulseAtr * atr && MathAbs(c1 - o1) >= InpImpulseBody * rng1)
+     {
+      double mid1 = (h1 + l1) * 0.5;
+      if(c1 > o1 && imb >= InpMinFlowImb && tk.bid > mid1 && tk.bid - c1 <= chase && htf >= 0 && BookAgrees(1))
+        { dir = 1; setup = "impulse"; }
+      else
+         if(c1 < o1 && imb <= -InpMinFlowImb && tk.bid < mid1 && c1 - tk.bid <= chase && htf <= 0 && BookAgrees(-1))
+           { dir = -1; setup = "impulse"; }
+     }
+
+   // 3. Sweep: this candle ran the range stops, came back inside, and flow flipped.
+   if(dir == 0 && InpUseSweep)
      {
       bool htfLong  = !InpHtfFilterFades || htf >= 0;
       bool htfShort = !InpHtfFilterFades || htf <= 0;
-      // Price ran the stops above the range, then fell back inside with sellers in control.
-      if(barHigh > rangeHigh && tk.bid < rangeHigh && imb <= -InpMinFlowImb &&
-         (!book || g_bookImb <= -InpMinBookImb) && htfShort)
-        { dir = -1; setup = "sweep_fade"; }
+      if(barHigh > rangeHigh && tk.bid < rangeHigh && rangeHigh - tk.bid <= chase &&
+         imb <= -InpMinFlowImb && htfShort && BookAgrees(-1))
+        { dir = -1; setup = "sweep"; }
       else
-         if(barLow < rangeLow && tk.bid > rangeLow && imb >= InpMinFlowImb &&
-            (!book || g_bookImb >= InpMinBookImb) && htfLong)
-           { dir = 1; setup = "sweep_fade"; }
+         if(barLow < rangeLow && tk.bid > rangeLow && tk.bid - rangeLow <= chase &&
+            imb >= InpMinFlowImb && htfLong && BookAgrees(1))
+           { dir = 1; setup = "sweep"; }
      }
+
    if(dir == 0)
      {
-      Skip(SKIP_NOSIGNAL, StringFormat("scanning | flow %+.2f | speed %.1fx", imb, rateX));
+      Skip(SKIP_NOSIGNAL, StringFormat("scanning | flow %+.2f | speed %.1fx | trend %s",
+                                       imb, rateX, htf > 0 ? "up" : (htf < 0 ? "down" : "off")));
       return;
      }
 
-   // Stop sits on the bid side for longs and the ask side for shorts, so the
+   // The stop sits on the bid side for longs and the ask side for shorts, so the
    // risk we size for is stop distance + spread.
    double minStop = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
    double slDist  = MathMax(InpSlAtr * atr, InpSlMinSpreads * spread);
@@ -649,7 +719,7 @@ void TryEntry()
    double lots    = LotsForRisk(risk);
    if(lots <= 0.0)
      {
-      Skip(SKIP_MINLOT, "min lot risks too much: lower the stop or raise risk %");
+      Skip(SKIP_MINLOT, "min lot risks too much: raise risk % or use fixed lots");
       if(!g_minLotWarned)
         {
          g_minLotWarned = true;
@@ -682,8 +752,8 @@ void TryEntry()
    g_atrEntry    = atr;
    g_flowEntry   = imb;
    g_rateEntry   = rateX;
-   g_bookEntry   = book ? g_bookImb : 0.0;
-   g_bookLvEntry = book ? g_bookLevels : 0;
+   g_bookEntry   = BookLive() ? g_bookImb : 0.0;
+   g_bookLvEntry = BookLive() ? g_bookLevels : 0;
    g_mfe         = 0.0;
    g_mae         = 0.0;
    g_lots        = lots;
@@ -699,10 +769,12 @@ void TryEntry()
       g_openTime = now;
      }
    g_riskDist = MathAbs(g_entry - sl);
-   PrintFormat("%s %s %.2f lots @ %s, stop %s (%.1f spreads), flow %+.2f, speed %.1fx%s",
-               setup, dir > 0 ? "BUY" : "SELL", lots, DoubleToString(g_entry, _Digits),
-               DoubleToString(sl, _Digits), slDist / spread, imb, rateX,
-               book ? StringFormat(", book %+.2f", g_bookImb) : "");
+   if(InpVerbose)
+      PrintFormat("ENTRY %s %s %.2f lots @ %s | stop %s (risk %s = %.1f spreads) | flow %+.2f | speed %.1fx%s",
+                  setup, dir > 0 ? "BUY" : "SELL", lots, DoubleToString(g_entry, _Digits),
+                  DoubleToString(sl, _Digits), DoubleToString(g_riskDist, _Digits),
+                  spread > 0.0 ? g_riskDist / spread : 0.0, imb, rateX,
+                  BookLive() ? StringFormat(" | book %+.2f", g_bookImb) : "");
   }
 
 //+------------------------------------------------------------------+
@@ -712,10 +784,10 @@ void ManagePosition()
   {
    if(!SelectOurPosition())
       return;
-   ulong  ticket = (ulong)PositionGetInteger(POSITION_TICKET);
-   long   type   = PositionGetInteger(POSITION_TYPE);
-   double open   = PositionGetDouble(POSITION_PRICE_OPEN);
-   double sl     = PositionGetDouble(POSITION_SL);
+   ulong    ticket = (ulong)PositionGetInteger(POSITION_TICKET);
+   long     type   = PositionGetInteger(POSITION_TYPE);
+   double   open   = PositionGetDouble(POSITION_PRICE_OPEN);
+   double   sl     = PositionGetDouble(POSITION_SL);
    datetime opened = (datetime)PositionGetInteger(POSITION_TIME);
    if(ticket != g_posTicket)
      {
@@ -736,11 +808,10 @@ void ManagePosition()
    if(!SymbolInfoTick(_Symbol, tk))
       return;
 
-   // Trade the candle: out at the close of the entry bar (or after N bars).
-   datetime entryBar = (datetime)((long)opened - (long)opened % 60);
-   if(TimeCurrent() >= entryBar + 60 * InpMaxHoldBars - InpExitSecBeforeClose)
+   // Trade the candle: out at the close of the entry candle (or after N candles).
+   if(TimeCurrent() >= BarStart(opened) + g_barSec * InpMaxHoldBars - InpExitSecBeforeClose)
      {
-      CloseOurPosition("bar close");
+      CloseOurPosition("candle close");
       return;
      }
 
@@ -781,7 +852,7 @@ void ManagePosition()
   }
 
 //+------------------------------------------------------------------+
-//| Bookkeeping: losing streaks and the CSV trade log                |
+//| Bookkeeping: losing streaks, results and the CSV trade log       |
 //+------------------------------------------------------------------+
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
@@ -807,6 +878,14 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
                 HistoryDealGetDouble(trans.deal, DEAL_COMMISSION) + g_inCommission;
    g_inCommission = 0.0;
 
+   // The closing deal is opposite to the position: a SELL deal closes a long.
+   bool   wasLong = HistoryDealGetInteger(trans.deal, DEAL_TYPE) == DEAL_TYPE_SELL;
+   double exitPx  = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
+   double r       = g_riskDist > 0.0 ? (wasLong ? exitPx - g_entry : g_entry - exitPx) / g_riskDist : 0.0;
+   g_sumR += r;
+   if(pnl > 0.0)
+      g_wins++;
+
    if(pnl < 0.0)
      {
       g_consecLosses++;
@@ -820,15 +899,36 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    else
       g_consecLosses = 0;
 
+   string why = ExitReason(trans.deal);
+   if(InpVerbose)
+      PrintFormat("EXIT  %s %s @ %s (%s) | %+.2fR | %+.2f %s | best %+.2fR worst %+.2fR",
+                  g_setup, wasLong ? "long" : "short", DoubleToString(exitPx, _Digits), why, r,
+                  pnl, AccountInfoString(ACCOUNT_CURRENCY),
+                  g_riskDist > 0.0 ? g_mfe / g_riskDist : 0.0, g_riskDist > 0.0 ? g_mae / g_riskDist : 0.0);
    if(InpLogTrades)
-      LogTrade(trans.deal, pnl);
+      LogTrade(trans.deal, pnl, wasLong, why);
+
    g_posTicket = 0;
    g_setup     = "";
    g_riskDist  = 0.0;
    g_atrEntry  = 0.0;
   }
 
-void LogTrade(ulong deal, double pnl)
+string ExitReason(ulong deal)
+  {
+   long reason = HistoryDealGetInteger(deal, DEAL_REASON);
+   if(reason == DEAL_REASON_SL)
+      return "stop";
+   if(reason == DEAL_REASON_TP)
+      return "tp";
+   if(reason == DEAL_REASON_SO)
+      return "stop_out";
+   if(reason == DEAL_REASON_EXPERT)
+      return "candle_close";
+   return "manual";
+  }
+
+void LogTrade(ulong deal, double pnl, bool wasLong, const string why)
   {
    string name = "ScalpEngine_" + _Symbol + ".csv";
    int h = FileOpen(name, FILE_READ | FILE_WRITE | FILE_CSV | FILE_ANSI | FILE_SHARE_READ, ',');
@@ -842,19 +942,10 @@ void LogTrade(ulong deal, double pnl)
                 "sl_initial", "risk", "spread", "atr", "flow_imb", "speed_x", "book_imb", "book_levels",
                 "mfe", "mae", "exit_reason", "pnl");
    FileSeek(h, 0, SEEK_END);
-
-   long reason = HistoryDealGetInteger(deal, DEAL_REASON);
-   string why  = reason == DEAL_REASON_SL ? "stop" :
-                 reason == DEAL_REASON_TP ? "tp" :
-                 reason == DEAL_REASON_SO ? "stop_out" :
-                 reason == DEAL_REASON_EXPERT ? "ea_close" : "manual";
-   // The closing deal is opposite to the position: a SELL deal closes a long.
-   string side = HistoryDealGetInteger(deal, DEAL_TYPE) == DEAL_TYPE_SELL ? "long" : "short";
-
    FileWrite(h,
              TimeToString(g_openTime, TIME_DATE | TIME_SECONDS),
              TimeToString((datetime)HistoryDealGetInteger(deal, DEAL_TIME), TIME_DATE | TIME_SECONDS),
-             _Symbol, side, g_setup,
+             _Symbol, wasLong ? "long" : "short", g_setup,
              DoubleToString(g_lots, 2),
              DoubleToString(g_entry, _Digits),
              DoubleToString(HistoryDealGetDouble(deal, DEAL_PRICE), _Digits),
@@ -883,22 +974,25 @@ void ShowPanel()
    FlowStats(imb, rate, baseRate);
    double atr    = Atr();
    double spread = tk.ask - tk.bid;
-   string book   = BookLive() ? StringFormat("%+.2f (%d lv)", g_bookImb, g_bookLevels)
+   int    htf    = HtfDir();
+   long   left   = (long)iTime(_Symbol, g_tf, 0) + g_barSec - (long)TimeCurrent();
+   string book   = BookLive() ? StringFormat("%+.2f (%d levels)", g_bookImb, g_bookLevels)
                               : (g_bookSubscribed ? "subscribed, empty" : "not available");
    Comment(StringFormat(
-              "ScalpEngine  %s\n"
-              "Spread %s | ATR(1m) %s | ATR/spread %.1f (need %.1f)\n"
-              "Flow %+.2f (%s) | speed %.1fx\n"
+              "ScalpEngine v2  %s %s  |  candle closes in %ds\n"
+              "Spread %s | ATR %s | ATR/spread %.1f (need %.1f)\n"
+              "Flow %+.2f (%s) | speed %.1fx | feed %.2f ticks/s | trend %s\n"
               "Book: %s\n"
-              "Trades today %d/%d | losing streak %d\n"
+              "Today %d/%d trades | session %d entries, %d wins, %+.2fR | losing streak %d\n"
               "%s",
-              _Symbol,
+              _Symbol, EnumToString(g_tf), left > 0 ? (int)left : 0,
               DoubleToString(spread, _Digits), DoubleToString(atr, _Digits),
               spread > 0.0 ? atr / spread : 0.0, InpMinAtrToSpread,
               imb, g_hasAggFlags ? "aggressor flags" : "tick rule",
-              baseRate > 0.0 ? rate / baseRate : 0.0,
+              baseRate > 0.0 ? rate / baseRate : 0.0, baseRate,
+              htf > 0 ? "up" : (htf < 0 ? "down" : "off"),
               book,
-              g_tradesToday, InpMaxTradesPerDay, g_consecLosses,
+              g_tradesToday, InpMaxTradesPerDay, g_entries, g_wins, g_sumR, g_consecLosses,
               g_status));
   }
 //+------------------------------------------------------------------+

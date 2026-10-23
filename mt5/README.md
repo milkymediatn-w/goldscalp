@@ -1,7 +1,7 @@
-# ScalpEngine: 1m order-flow scalper for MT5 (Exness)
+# ScalpEngine v2: candle scalper for MT5 (Exness)
 
-An Expert Advisor that trades 1-minute candles: it enters early in a bar when tick flow confirms a
-range breakout or a stop-sweep, puts a tight stop on, moves it to break-even, trails it with ATR,
+An Expert Advisor that trades one candle at a time. It enters early in a candle when tick flow
+confirms one of three setups, puts a tight stop on, moves it to break-even, trails it with ATR,
 and closes at the candle close. There is no take-profit.
 
 | File | What it is |
@@ -10,26 +10,42 @@ and closes at the candle close. There is no take-profit.
 | `Scripts/FeedProbe.mq5` | Measures what your broker really sends (order book, trade flags, spread, tick speed) |
 | `analyze_trades.py` | Reads the EA's trade log and reports expectancy in R |
 
-## What the EA uses
+## Why M3 by default
 
-- **Tick flow:** every tick is pulled with `CopyTicks`, so none are skipped. When the broker
-  marks trades as buy or sell, the EA uses those flags. Exness CFDs only send quotes, so the EA falls
-  back to the *tick rule*: a quote that moves up counts as buying, one that moves down counts as
-  selling. Flow imbalance runs from -1 to +1 over the last `InpFlowWindowSec` seconds.
-- **Tick speed:** ticks per second now, compared with the 10-minute average. Breakouts need a burst.
-- **Range:** the high and low of the last `InpRangeBars` closed bars.
-  - **Breakout:** price is past the range by no more than 0.5 ATR, with flow in the same direction
-    and a speed burst.
-  - **Sweep fade:** this bar ran past the range, came back inside, and flow flipped.
-- **Depth of market:** an imbalance across the top `InpBookLevels` levels. It is used only if the
-  broker actually publishes a book. If not, the EA ignores it (the FeedProbe script tells you which).
-- **Trend filter:** on M5, a close above or below an EMA, for breakouts only by default.
+FeedProbe on Exness BTCUSDm (2026-10-23) measured:
+
+- **Spread:** a fixed $6.40.
+- **1m ATR:** $18, so one round trip costs about 35% of an average 1m candle.
+- **Order book:** none.
+- **Trade flags:** none. The feed only sends quotes.
+
+The spread is a fixed cost, but candle size grows with time. On M3 the average candle is roughly
+$30, so the spread drops to about 20%. `InpTF` can be set anywhere from M1 to M15.
+
+## Setups
+
+| Setup | Condition |
+|---|---|
+| `breakout` | Price leaves the high/low of the last `InpRangeBars` candles, by no more than `InpMaxChaseAtr`. Flow must agree, and tick speed must be at least `InpMinTickRateX` times the 10-minute average. |
+| `impulse` | The last candle was at least `InpImpulseAtr` times ATR, with a body of at least `InpImpulseBody` of its range. Flow still pushes the same way and price holds that candle's half. |
+| `sweep` | This candle ran past the range, came back inside, and flow flipped. Fade it. |
+
+**Flow** is the buy/sell imbalance over the last `InpFlowWindowSec` seconds. On a quote-only feed
+it is computed with the *tick rule*: a quote that moves up counts as buying, one that moves down
+counts as selling. If the feed has real trade flags, those are used instead.
+
+**Trend filter:** close against an EMA on `InpHtfTF` (default M15 EMA50). It applies to breakout
+and impulse; it applies to sweep only if `InpHtfFilterFades` is on.
+
+**Depth of market:** an imbalance is added only when the broker publishes a book. Exness does not
+for BTCUSDm.
 
 ## Protections
 
-- **Cost gate:** 1m ATR must be at least `InpMinAtrToSpread` times the current spread, and the
-  stop must be at least `InpSlMinSpreads` spreads. This is what keeps a 1m scalper from paying all
-  its edge in spread.
+- **Cost gate:** the candle's ATR must be at least `InpMinAtrToSpread` times the spread, and the
+  stop must be at least `InpSlMinSpreads` spreads.
+- **Regime filters:** skip volatility spikes (ATR(14) above `InpMaxAtrSpikeX` times ATR(100)) and
+  slow feeds (below `InpMinTickRate` ticks per second).
 - **Sizing:** position size from risk % of equity, with a lot cap.
 - **Daily loss limit:** stops trading for the server day after an equity drawdown of
   `InpMaxDailyLossPct`. It is measured on account equity, so it counts every position on the
@@ -37,6 +53,8 @@ and closes at the candle close. There is no take-profit.
 - **Losing streak:** pauses after N losses in a row.
 - **Trade count:** a maximum number of trades per day, and one trade per bar.
 - **Sessions:** trading hours in server time. Exness server time is UTC.
+- **Report:** when the EA stops, it prints how many candles each filter skipped, plus entries,
+  wins and total R. An on-chart panel shows the live state.
 - **Trade log:** every closed trade goes to `MQL5/Files/ScalpEngine_<symbol>.csv` with entry
   context, spread, MFE and MAE, and the exit reason.
 
@@ -57,7 +75,8 @@ and closes at the candle close. There is no take-profit.
 
 In the Strategy Tester (Ctrl+R):
 
-- **Expert:** ScalpEngine. **Symbol:** BTCUSDm. **Timeframe:** M1.
+- **Expert:** ScalpEngine. **Symbol:** BTCUSDm. **Timeframe:** any. The EA uses `InpTF`, not
+  the chart timeframe.
 - **Modelling:** **Every tick based on real ticks**. Any other mode is useless for a scalper.
 - **Dates:** the last 2–3 months. **Forward:** 1/3. MT5 then keeps the last third out of sample.
 - **Deposit and leverage:** the same as your real account.
@@ -73,7 +92,7 @@ python mt5/analyze_trades.py path/to/ScalpEngine_BTCUSDm.csv
 ```
 
 Optimise only a few inputs at a time, for example `InpMinFlowImb`, `InpSlAtr`, `InpTrailStartR`,
-`InpRangeBars` and `InpMode`. Keep only settings that also work on the forward third.
+`InpRangeBars`, `InpTF` and the three `InpUse*` setup switches. Keep only settings that also work on the forward third.
 
 ## Step 3: demo, then smallest live size
 
@@ -88,5 +107,5 @@ Optimise only a few inputs at a time, for example `InpMinFlowImb`, `InpSlAtr`, `
 - On a CFD feed the "order flow" is inferred from quote changes, not real trades. It is a proxy.
   Real footprint data needs an exchange feed: CME through a futures broker, or Binance or Bybit for
   crypto.
-- The EA has not been compiled or run yet. Compile it in MetaEditor and send me any errors.
+- v1 compiled with 0 errors in MetaEditor; v2 still needs its first compile.
 - Nothing here is profitable until the tester and a demo account say so.
