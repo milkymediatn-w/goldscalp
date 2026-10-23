@@ -111,6 +111,33 @@ int      g_consecLosses   = 0;
 datetime g_pauseUntil     = 0;
 string   g_status         = "";
 
+//--- diagnostics: why bars were skipped (each reason counted once per bar)
+#define SKIP_HALTED   0
+#define SKIP_PAUSED   1
+#define SKIP_MAXDAY   2
+#define SKIP_ALGO     3
+#define SKIP_SESSION  4
+#define SKIP_SPREAD   5
+#define SKIP_ATR      6
+#define SKIP_NOSIGNAL 7
+#define SKIP_MINLOT   8
+#define SKIP_FAILED   9
+#define SKIP_NODATA   10
+#define SKIP_COUNT    11
+string   g_skipName[SKIP_COUNT] = {"daily loss limit", "losing-streak pause", "max trades per day",
+                                   "algo trading disabled", "outside session", "spread above max",
+                                   "ATR < min x spread", "no setup", "min lot risks too much",
+                                   "order rejected", "no ATR/bar data"};
+int      g_skipBars[SKIP_COUNT];
+datetime g_skipLastBar[SKIP_COUNT];
+int      g_barsSeen      = 0;
+datetime g_lastSeenBar   = 0;
+double   g_ratioSum      = 0.0;
+int      g_ratioN        = 0;
+datetime g_lastRatioBar   = 0;
+int      g_entries       = 0;
+bool     g_minLotWarned  = false;
+
 //--- context of the open trade (for logging and R maths)
 ulong    g_posTicket   = 0;
 string   g_setup       = "";
@@ -136,6 +163,8 @@ int OnInit()
    ArrayInitialize(g_buy, 0);
    ArrayInitialize(g_sell, 0);
    ArrayInitialize(g_cnt, 0);
+   ArrayInitialize(g_skipBars, 0);
+   ArrayInitialize(g_skipLastBar, 0);
 
    if(InpFlowWindowSec < 5 || InpFlowWindowSec > 120)
      { Print("InpFlowWindowSec must be within 5..120"); return INIT_PARAMETERS_INCORRECT; }
@@ -175,6 +204,7 @@ int OnInit()
 void OnDeinit(const int reason)
   {
    EventKillTimer();
+   PrintSkipReport();
    if(g_bookSubscribed)
       MarketBookRelease(_Symbol);
    if(g_atrHandle != INVALID_HANDLE)
@@ -493,43 +523,78 @@ void DayCheck()
   }
 
 //+------------------------------------------------------------------+
+//| Diagnostics                                                      |
+//+------------------------------------------------------------------+
+void Skip(int reason, const string status)
+  {
+   g_status = status;
+   datetime bar = iTime(_Symbol, PERIOD_M1, 0);
+   if(g_skipLastBar[reason] != bar)
+     {
+      g_skipLastBar[reason] = bar;
+      g_skipBars[reason]++;
+     }
+  }
+
+void PrintSkipReport()
+  {
+   PrintFormat("=== ScalpEngine report: %d bars inside the entry window, %d entries ===", g_barsSeen, g_entries);
+   if(g_ratioN > 0)
+      PrintFormat("Average 1m ATR / spread: %.2f (filter needs >= %.1f)", g_ratioSum / g_ratioN, InpMinAtrToSpread);
+   for(int r = 0; r < SKIP_COUNT; r++)
+      if(g_skipBars[r] > 0)
+         PrintFormat("  skipped by %-24s on %6d bars (%.1f%%)", g_skipName[r], g_skipBars[r],
+                     g_barsSeen > 0 ? 100.0 * g_skipBars[r] / g_barsSeen : 0.0);
+  }
+
+//+------------------------------------------------------------------+
 //| Entries                                                          |
 //+------------------------------------------------------------------+
 void TryEntry()
   {
-   if(g_haltDay)                               { g_status = "halted: daily loss limit"; return; }
-   if(TimeCurrent() < g_pauseUntil)            { g_status = "paused after losing streak"; return; }
-   if(g_tradesToday >= InpMaxTradesPerDay)     { g_status = "max trades for today"; return; }
    if(SelectOurPosition())                     { g_status = "in position"; return; }
-   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
-                                               { g_status = "algo trading disabled"; return; }
 
    datetime bar = iTime(_Symbol, PERIOD_M1, 0);
    if(bar == 0 || bar == g_lastEntryBar)
       return;
    datetime now = TimeCurrent();
    if(now - bar > InpEntryWindowSec)           { g_status = "waiting for next bar"; return; }
+   if(bar != g_lastSeenBar)
+     {
+      g_lastSeenBar = bar;
+      g_barsSeen++;
+     }
+
+   if(g_haltDay)                               { Skip(SKIP_HALTED, "halted: daily loss limit"); return; }
+   if(TimeCurrent() < g_pauseUntil)            { Skip(SKIP_PAUSED, "paused after losing streak"); return; }
+   if(g_tradesToday >= InpMaxTradesPerDay)     { Skip(SKIP_MAXDAY, "max trades for today"); return; }
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
+                                               { Skip(SKIP_ALGO, "algo trading disabled"); return; }
 
    MqlDateTime dt;
    TimeToStruct(now, dt);
    if(dt.hour < InpSessionStartHour || dt.hour >= InpSessionEndHour)
-                                               { g_status = "outside session"; return; }
+                                               { Skip(SKIP_SESSION, "outside session"); return; }
 
    MqlTick tk;
    if(!SymbolInfoTick(_Symbol, tk) || tk.bid <= 0.0 || tk.ask <= 0.0)
       return;
    double spread = tk.ask - tk.bid;
    double atr    = Atr();
-   if(atr <= 0.0)
-      return;
+   if(atr <= 0.0)                              { Skip(SKIP_NODATA, "waiting for ATR data"); return; }
+   if(spread > 0.0 && bar != g_lastRatioBar)
+     {
+      g_lastRatioBar = bar;
+      g_ratioSum += atr / spread;
+      g_ratioN++;
+     }
    if(InpMaxSpreadPts > 0 && spread > InpMaxSpreadPts * _Point)
-                                               { g_status = "spread too wide"; return; }
-   if(atr < InpMinAtrToSpread * spread)        { g_status = "range too small for the spread"; return; }
+                                               { Skip(SKIP_SPREAD, "spread too wide"); return; }
+   if(atr < InpMinAtrToSpread * spread)        { Skip(SKIP_ATR, "range too small for the spread"); return; }
 
    int idxH = iHighest(_Symbol, PERIOD_M1, MODE_HIGH, InpRangeBars, 1);
    int idxL = iLowest(_Symbol, PERIOD_M1, MODE_LOW, InpRangeBars, 1);
-   if(idxH < 0 || idxL < 0)
-      return;
+   if(idxH < 0 || idxL < 0)                    { Skip(SKIP_NODATA, "waiting for bar data"); return; }
    double rangeHigh = iHigh(_Symbol, PERIOD_M1, idxH);
    double rangeLow  = iLow(_Symbol, PERIOD_M1, idxL);
    double barHigh   = iHigh(_Symbol, PERIOD_M1, 0);
@@ -570,7 +635,7 @@ void TryEntry()
      }
    if(dir == 0)
      {
-      g_status = StringFormat("scanning | flow %+.2f | speed %.1fx", imb, rateX);
+      Skip(SKIP_NOSIGNAL, StringFormat("scanning | flow %+.2f | speed %.1fx", imb, rateX));
       return;
      }
 
@@ -584,7 +649,16 @@ void TryEntry()
    double lots    = LotsForRisk(risk);
    if(lots <= 0.0)
      {
-      g_status = "min lot risks too much: lower the stop or raise risk %";
+      Skip(SKIP_MINLOT, "min lot risks too much: lower the stop or raise risk %");
+      if(!g_minLotWarned)
+        {
+         g_minLotWarned = true;
+         double mn = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+         PrintFormat("Min lot %.2f would risk %.2f %s on this stop, target is %.2f (%.2f%% of equity). "
+                     "Raise InpRiskPercent or use fixed lots (InpRiskPercent=0).",
+                     mn, mn * MoneyPerLot(risk), AccountInfoString(ACCOUNT_CURRENCY),
+                     AccountInfoDouble(ACCOUNT_EQUITY) * InpRiskPercent / 100.0, InpRiskPercent);
+        }
       g_lastEntryBar = bar;
       return;
      }
@@ -594,12 +668,14 @@ void TryEntry()
    g_lastEntryBar = bar;
    if(!ok || (trade.ResultRetcode() != TRADE_RETCODE_DONE && trade.ResultRetcode() != TRADE_RETCODE_PLACED))
      {
+      Skip(SKIP_FAILED, "order rejected");
       PrintFormat("%s %s failed: %d %s", setup, dir > 0 ? "BUY" : "SELL",
                   trade.ResultRetcode(), trade.ResultRetcodeDescription());
       return;
      }
 
    g_tradesToday++;
+   g_entries++;
    g_setup       = setup;
    g_slInitial   = sl;
    g_spreadEntry = spread;
