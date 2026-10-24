@@ -1,35 +1,36 @@
 //+------------------------------------------------------------------+
-//| MomentumScalper.mq5                                              |
-//| High-frequency trend + momentum scalper for MT5 (built around    |
-//| Exness BTCUSDm). Decides on every tick, holds seconds to a few   |
-//| minutes.                                                         |
+//| MomentumScalper.mq5  v2                                          |
+//| High-frequency momentum + price-action + VWAP + SMC scalper      |
+//| for MT5 (built around Exness BTCUSDm). Decides on every tick,    |
+//| holds seconds to a few minutes, one position at a time.          |
 //|                                                                  |
-//| Trend     : M1 EMA fast/slow, optional HTF EMA, rolling VWAP     |
-//| Setups    : burst    - price jumps N spreads in a few seconds    |
-//|                        with one-sided flow and fast ticks        |
-//|             pullback - in trend, price dips 0.3-1.2 ATR, then    |
-//|                        breaks the last closed M1 candle again    |
-//| Profile   : rolling tick-volume profile (POC, value area, HVNs): |
-//|             trade on the right side of POC, and only with room   |
-//|             to the next high-volume level                        |
-//| Exits     : stop, optional TP in R, break-even, ATR trail,       |
-//|             time stop in seconds, flow-fade exit                 |
-//| Safety    : cooldown, trades/hour and /day caps, daily loss      |
-//|             limit, losing-streak pause, spread and spike filters |
+//| An entry needs ONE trigger and a confluence SCORE >= InpMinScore.|
 //|                                                                  |
-//| No martingale, no grid, no averaging down: one position at a     |
-//| time, sized from a fixed lot or a fixed % risk.                  |
-//| Closed trades go to MQL5/Files/MomentumScalper_<symbol>.csv.     |
+//| Triggers                                                         |
+//|  burst : price moves N spreads in a few seconds, flow one-sided  |
+//|  bos   : price breaks the last unbroken M1 swing (BOS / CHoCH)   |
+//|  sweep : price wicks through a swing (liquidity grab) and        |
+//|          reclaims it with flow                                   |
+//|  fvg   : price taps an unfilled fair value gap and bounces       |
+//|                                                                  |
+//| Score (0-100)                                                    |
+//|  M1 EMA trend 15 | M5 EMA trend 10 | VWAP side 15 |              |
+//|  last structure break 10 | discount/premium 5 | flow 0-20 |      |
+//|  tick speed 0-10 | side of POC 5 | room to next volume level 10  |
+//|                                                                  |
+//| Hard gates: spread/ATR, volatility spike, daily loss, trade caps,|
+//| cooldown, losing-streak pause. No martingale, no grid.           |
+//| Closed trades: MQL5/Files/MomentumScalper_<symbol>.csv           |
 //+------------------------------------------------------------------+
 #property copyright "goldscalp"
-#property version   "1.00"
-#property description "HF trend + momentum scalper (burst, pullback, volume profile, VWAP)"
+#property version   "2.00"
+#property description "HF momentum + price action + VWAP + SMC scalper (trigger + confluence score)"
 
 #include <Trade/Trade.mqh>
 
 //--- general
 input group "General"
-input long   InpMagic             = 260425; // Magic number
+input long   InpMagic             = 260426; // Magic number
 input int    InpDeviationPts      = 300;    // Max slippage, points (BTCUSDm: 100 pts = $1)
 input bool   InpVerbose           = true;   // Print every entry and exit
 input bool   InpLogTrades         = true;   // Write closed trades to CSV
@@ -40,68 +41,66 @@ input double InpRiskPercent       = 0.0;    // Risk per trade, % of equity (0 = 
 input double InpFixedLots         = 0.01;   // Fixed lots when risk % is 0
 input double InpMaxLots           = 1.0;    // Hard cap on lots
 input double InpMaxDailyLossPct   = 3.0;    // Stop for the day after this equity drawdown %
-input int    InpMaxTradesPerDay   = 150;    // Max entries per server day
-input int    InpMaxTradesPerHour  = 20;     // Max entries per rolling hour
-input int    InpCooldownSec       = 15;     // Wait after any exit, seconds
+input int    InpMaxTradesPerDay   = 200;    // Max entries per server day
+input int    InpMaxTradesPerHour  = 25;     // Max entries per rolling hour
+input int    InpCooldownSec       = 10;     // Wait after any exit, seconds
 input int    InpMaxConsecLosses   = 5;      // Pause after this many losses in a row
-input int    InpLossPauseMin      = 20;     // Pause length, minutes
+input int    InpLossPauseMin      = 15;     // Pause length, minutes
 
-//--- costs and regime
-input group "Costs and regime"
+//--- hard gates
+input group "Hard gates"
 input int    InpMaxSpreadPts      = 0;      // Max spread, points (0 = off)
-input double InpMinAtrToSpread    = 2.5;    // M1 ATR must be >= this x spread
-input double InpMaxAtrSpikeX      = 3.0;    // Skip when M1 ATR(14) > this x ATR(100)
-input double InpMinTickRate       = 0.2;    // Skip when the feed is slower than this, ticks/s
+input double InpMinAtrToSpread    = 2.0;    // M1 ATR must be >= this x spread
+input double InpMaxAtrSpikeX      = 3.5;    // Skip when M1 ATR(14) > this x ATR(100)
+input double InpMinTickRate       = 0.1;    // Skip when the feed is slower than this, ticks/s
 
-//--- trend
-input group "Trend"
-input bool   InpRequireTrend      = true;   // Only trade in the trend direction
+//--- triggers
+input group "Triggers"
+input bool   InpUseBurst          = true;   // Momentum burst
+input bool   InpUseBos            = true;   // Break of structure / CHoCH
+input bool   InpUseSweep          = true;   // Liquidity sweep and reclaim
+input bool   InpUseFvg            = true;   // Fair value gap tap and bounce
+input int    InpBurstSec          = 8;      // Burst look-back, seconds (also the flow window)
+input double InpBurstMinSpreads   = 1.2;    // Burst: move >= this many spreads in the look-back
+input double InpBurstMaxAtr       = 1.2;    // Burst: ...but <= this x ATR (overextended)
+input double InpBurstMinSpeedX    = 1.2;    // Burst: tick speed >= this x 10-min average
+input double InpTrigMinFlow       = 0.25;   // Every trigger: flow must agree by at least this
+input double InpMaxChaseAtr       = 0.5;    // Skip if price is this many ATR past the trigger level
+
+//--- structure
+input group "Structure (smart money concepts)"
+input int    InpStructBars        = 120;    // M1 candles scanned for swings, BOS/CHoCH and FVGs
+input int    InpPivotK            = 2;      // Swing = high/low with K lower/higher candles each side
+input int    InpRangeBars         = 60;     // Dealing range for premium/discount, M1 candles
+input double InpFvgMinAtr         = 0.2;    // Min FVG size, x ATR
+input int    InpFvgLookback       = 20;     // FVGs younger than this many candles
+
+//--- confluence
+input group "Confluence score"
+input int    InpMinScore          = 55;     // Min score (0-100) to enter
 input int    InpEmaFast           = 9;      // M1 fast EMA
 input int    InpEmaSlow           = 21;     // M1 slow EMA
-input ENUM_TIMEFRAMES InpHtfTF    = PERIOD_M5; // Higher-timeframe filter
+input ENUM_TIMEFRAMES InpHtfTF    = PERIOD_M5; // Higher timeframe
 input int    InpHtfEma            = 50;     // HTF EMA period (0 = off)
-input bool   InpUseVwap           = true;   // Longs above VWAP, shorts below
-
-//--- burst
-input group "Setup: momentum burst"
-input bool   InpUseBurst          = true;   // Enable
-input int    InpBurstSec          = 10;     // Look-back, seconds
-input double InpBurstMinSpreads   = 1.5;    // Price must move >= this many spreads in the look-back
-input double InpBurstMaxAtr       = 1.0;    // ...but not more than this x ATR (overextended)
-input double InpBurstMinFlow      = 0.40;   // Min flow imbalance in the look-back, 0..1
-input double InpBurstMinSpeedX    = 1.5;    // Tick speed >= this x 10-min average
-
-//--- pullback
-input group "Setup: pullback continuation"
-input bool   InpUsePullback       = true;   // Enable
-input int    InpPbLookback        = 8;      // M1 candles to find the swing
-input double InpPbMinAtr          = 0.3;    // Pullback depth >= this x ATR
-input double InpPbMaxAtr          = 1.2;    // Pullback depth <= this x ATR
-input double InpPbMinFlow         = 0.20;   // Flow must agree by at least this
-input double InpMaxChaseAtr       = 0.4;    // Skip if price ran this many ATR past the trigger
-
-//--- volume profile
-input group "Volume profile (tick volume)"
-input bool   InpUseProfile        = true;   // Enable profile filters
-input int    InpProfileBars       = 240;    // M1 candles in the profile (240 = 4 hours)
-input int    InpProfileBinPts     = 0;      // Bin size, points (0 = auto: ATR / 4)
-input double InpHvnPct            = 0.60;   // HVN = local peak >= this x POC volume
-input bool   InpProfileBias       = true;   // Longs only above POC, shorts only below
-input double InpMinRoomR          = 1.0;    // Need this many R of room to the next POC/VA edge/HVN
+input int    InpProfileBars       = 240;    // M1 candles for the rolling VWAP and volume profile
+input double InpHvnPct            = 0.60;   // HVN = local profile peak >= this x POC volume
+input double InpRoomR             = 1.0;    // Room points need this many R to the next volume level
 
 //--- exits
 input group "Exits"
-input double InpSlAtr             = 0.8;    // Initial stop, x M1 ATR
-input double InpSlMinSpreads      = 2.5;    // Stop at least this many spreads
-input double InpTpR               = 1.5;    // Take profit in R (0 = none, trail only)
-input double InpBreakEvenR        = 0.6;    // Move stop to entry at +R (0 = off)
-input double InpTrailStartR       = 1.0;    // Start trailing at +R (0 = off)
+input double InpSlAtr             = 1.0;    // Initial stop, x ATR
+input double InpSlMinSpreads      = 3.0;    // Stop at least this many spreads
+input bool   InpStructSl          = true;   // Sweep/FVG: stop beyond the wick or gap if wider
+input double InpSlMaxAtr          = 2.0;    // Never wider than this x ATR
+input double InpTpR               = 1.0;    // Take profit in R (0 = none, trail only)
+input double InpBreakEvenR        = 0.5;    // Move stop to entry at +R (0 = off)
+input double InpTrailStartR       = 0.8;    // Start trailing at +R (0 = off)
 input double InpTrailAtr          = 0.6;    // Trail distance, x ATR
-input int    InpMaxHoldSec        = 180;    // Time stop, seconds (0 = off)
+input int    InpMaxHoldSec        = 240;    // Time stop, seconds (0 = off)
 input bool   InpFlowExit          = true;   // Exit when flow turns hard against the trade
-input double InpExitFlow          = 0.50;   // ...imbalance against, over the burst look-back
+input double InpExitFlow          = 0.55;   // ...imbalance against
 input int    InpFlowExitMinSec    = 10;     // ...only after holding this long
-input double InpFlowExitMaxR      = 0.5;    // ...and only while profit is below this R
+input double InpFlowExitMaxR      = 0.3;    // ...and only while profit is below this R
 
 //--- session
 input group "Session (server time, Exness = UTC)"
@@ -129,10 +128,16 @@ bool   g_hasAggFlags = false;
 int g_atr = INVALID_HANDLE, g_atrSlow = INVALID_HANDLE;
 int g_emaF = INVALID_HANDLE, g_emaS = INVALID_HANDLE, g_htf = INVALID_HANDLE;
 
-//--- volume profile and VWAP
+//--- per-candle context (rebuilt on each new M1 candle)
+datetime g_ctxBar = 0;
 double   g_poc = 0.0, g_vah = 0.0, g_val = 0.0, g_vwap = 0.0;
 double   g_hvn[];
-datetime g_profileBar = 0;
+double   g_swH = 0.0, g_swL = 0.0;           // last unbroken swing high / low
+int      g_structDir = 0;                    // +1 last break was bullish, -1 bearish
+bool     g_choch = false;                    // last break flipped the previous direction
+double   g_eq = 0.0;                         // equilibrium of the dealing range
+double   g_bullTop = 0.0, g_bullBot = 0.0;   // newest unfilled bullish FVG
+double   g_bearTop = 0.0, g_bearBot = 0.0;   // newest unfilled bearish FVG
 
 //--- state
 CTrade   trade;
@@ -143,20 +148,21 @@ int      g_tradesToday = 0;
 datetime g_entryTimes[64];
 int      g_entryIdx = 0;
 datetime g_lastExit = 0;
-datetime g_pbBar = 0;
 int      g_consecLosses = 0;
 datetime g_pauseUntil = 0;
 datetime g_lastCloseTry = 0;
 string   g_closeWhy = "";
 string   g_status = "";
+string   g_lastCand = "";
+datetime g_trigUsed[4];
 
 //--- open trade context
 ulong    g_posTicket = 0;
 string   g_setup = "";
-int      g_dir = 0;
 double   g_entry = 0.0, g_riskDist = 0.0, g_slInitial = 0.0, g_spreadEntry = 0.0, g_atrEntry = 0.0;
-double   g_flowEntry = 0.0, g_speedEntry = 0.0, g_roomEntry = 0.0, g_mfe = 0.0, g_mae = 0.0;
+double   g_flowEntry = 0.0, g_speedEntry = 0.0, g_mfe = 0.0, g_mae = 0.0;
 double   g_inCommission = 0.0, g_lots = 0.0;
+int      g_scoreEntry = 0;
 datetime g_openTime = 0;
 
 //--- diagnostics
@@ -169,17 +175,14 @@ datetime g_openTime = 0;
 #define SKIP_ATR      6
 #define SKIP_SPIKE    7
 #define SKIP_FEED     8
-#define SKIP_NOTREND  9
-#define SKIP_NOSETUP  10
-#define SKIP_PROFILE  11
-#define SKIP_ROOM     12
-#define SKIP_FAILED   13
-#define SKIP_COUNT    14
+#define SKIP_NOTRIG   9
+#define SKIP_SCORE    10
+#define SKIP_FAILED   11
+#define SKIP_COUNT    12
 string   g_skipName[SKIP_COUNT] = {"daily loss limit", "losing-streak pause", "hour/day trade cap",
                                    "algo trading disabled", "outside session", "spread above max",
-                                   "ATR < min x spread", "volatility spike", "slow feed", "no trend",
-                                   "no setup", "wrong side of POC", "no room to next level",
-                                   "order rejected"};
+                                   "ATR < min x spread", "volatility spike", "slow feed",
+                                   "no trigger", "score below minimum", "order rejected"};
 int      g_skipMin[SKIP_COUNT];
 datetime g_skipLast[SKIP_COUNT];
 int      g_minutesSeen = 0;
@@ -187,9 +190,10 @@ datetime g_lastSeenMin = 0;
 double   g_ratioSum = 0.0;
 int      g_ratioN = 0;
 datetime g_ratioMin = 0;
-string   g_setupName[2] = {"burst", "pullback"};
-int      g_setupN[2], g_setupW[2];
-double   g_setupR[2];
+#define TRIG_COUNT 4
+string   g_trigName[TRIG_COUNT] = {"burst", "bos", "sweep", "fvg"};
+int      g_trigN[TRIG_COUNT], g_trigW[TRIG_COUNT];
+double   g_trigR[TRIG_COUNT];
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -202,14 +206,15 @@ int OnInit()
    ArrayInitialize(g_entryTimes, 0);
    ArrayInitialize(g_skipMin, 0);
    ArrayInitialize(g_skipLast, 0);
-   ArrayInitialize(g_setupN, 0);
-   ArrayInitialize(g_setupW, 0);
-   ArrayInitialize(g_setupR, 0.0);
+   ArrayInitialize(g_trigN, 0);
+   ArrayInitialize(g_trigW, 0);
+   ArrayInitialize(g_trigR, 0.0);
+   ArrayInitialize(g_trigUsed, 0);
 
    if(InpBurstSec < 2 || InpBurstSec > 120)
      { Print("InpBurstSec must be within 2..120"); return INIT_PARAMETERS_INCORRECT; }
-   if(InpEmaFast >= InpEmaSlow || InpPbLookback < 3 || InpProfileBars < 30)
-     { Print("Check EMA periods, InpPbLookback (>= 3) and InpProfileBars (>= 30)"); return INIT_PARAMETERS_INCORRECT; }
+   if(InpEmaFast >= InpEmaSlow || InpPivotK < 1 || InpStructBars < 30 || InpProfileBars < 30)
+     { Print("Check EMA periods, InpPivotK (>= 1), InpStructBars and InpProfileBars (>= 30)"); return INIT_PARAMETERS_INCORRECT; }
 
    g_atr     = iATR(_Symbol, PERIOD_M1, 14);
    g_atrSlow = iATR(_Symbol, PERIOD_M1, 100);
@@ -228,16 +233,21 @@ int OnInit()
    PullTicks();
    RecoverPosition();
    EventSetTimer(1);
-   PrintFormat("MomentumScalper on %s | burst %ds/%.1f spreads | pullback %.1f-%.1f ATR | stop %.2fxATR "
-               "(min %.1f spreads) | TP %.1fR | time stop %ds | %s",
-               _Symbol, InpBurstSec, InpBurstMinSpreads, InpPbMinAtr, InpPbMaxAtr, InpSlAtr,
-               InpSlMinSpreads, InpTpR, InpMaxHoldSec,
+   PrintFormat("MomentumScalper v2 on %s | min score %d | stop %.1fxATR (min %.1f spreads, max %.1fxATR) | "
+               "TP %.1fR | BE %.1fR | trail from %.1fR | time stop %ds | %s",
+               _Symbol, InpMinScore, InpSlAtr, InpSlMinSpreads, InpSlMaxAtr, InpTpR, InpBreakEvenR,
+               InpTrailStartR, InpMaxHoldSec,
                InpRiskPercent > 0 ? StringFormat("risk %.2f%%", InpRiskPercent)
                                   : StringFormat("fixed %.2f lots", InpFixedLots));
    return INIT_SUCCEEDED;
   }
 
-//+------------------------------------------------------------------+
+void ReleaseHandle(int handle)
+  {
+   if(handle != INVALID_HANDLE)
+      IndicatorRelease(handle);
+  }
+
 void OnDeinit(const int reason)
   {
    EventKillTimer();
@@ -250,18 +260,12 @@ void OnDeinit(const int reason)
    Comment("");
   }
 
-void ReleaseHandle(int handle)
-  {
-   if(handle != INVALID_HANDLE)
-      IndicatorRelease(handle);
-  }
-
 //+------------------------------------------------------------------+
 void OnTick()
   {
    PullTicks();
    DayCheck();
-   RefreshProfile();
+   RefreshContext();
    ManagePosition();
    TryEntry();
   }
@@ -394,33 +398,44 @@ double MidSecondsAgo(int secAgo)
   }
 
 //+------------------------------------------------------------------+
-//| Volume profile + rolling VWAP from M1 tick volume                |
+//| Per-candle context: VWAP, volume profile, structure, FVGs        |
 //+------------------------------------------------------------------+
-void RefreshProfile()
+void RefreshContext()
   {
    datetime bar = iTime(_Symbol, PERIOD_M1, 0);
-   if(bar == 0 || bar == g_profileBar)
+   if(bar == 0 || bar == g_ctxBar)
       return;
+   double atr = Atr();
+   if(atr <= 0.0)
+      return;
+   g_ctxBar = bar;
+   BuildProfile(atr);
+   BuildStructure(atr);
+  }
+
+double TickVol(const MqlRates &r)
+  {
+   return r.tick_volume > 0 ? (double)r.tick_volume : 1.0;
+  }
+
+void BuildProfile(double atr)
+  {
    MqlRates r[];
    int n = CopyRates(_Symbol, PERIOD_M1, 1, InpProfileBars, r);
    if(n < 30)
       return;
-   g_profileBar = bar;
-
    double lo = DBL_MAX, hi = -DBL_MAX, pv = 0.0, vs = 0.0;
    for(int k = 0; k < n; k++)
      {
       lo = MathMin(lo, r[k].low);
       hi = MathMax(hi, r[k].high);
-      double v = (r[k].tick_volume > 0 ? (double)r[k].tick_volume : 1.0);
-      pv += (r[k].high + r[k].low + r[k].close) / 3.0 * v;
-      vs += v;
+      pv += (r[k].high + r[k].low + r[k].close) / 3.0 * TickVol(r[k]);
+      vs += TickVol(r[k]);
      }
    g_vwap = vs > 0.0 ? pv / vs : 0.0;
 
-   double atr = Atr();
-   double bin = InpProfileBinPts > 0 ? InpProfileBinPts * _Point : MathMax(atr / 4.0, 10 * _Point);
-   if(bin <= 0.0 || hi <= lo)
+   double bin = MathMax(atr / 4.0, 10 * _Point);
+   if(hi <= lo)
       return;
    int nb = (int)MathCeil((hi - lo) / bin) + 1;
    if(nb > 2000)
@@ -430,7 +445,6 @@ void RefreshProfile()
      }
    if(nb < 5)
       return;
-
    double raw[], vol[];
    ArrayResize(raw, nb);
    ArrayResize(vol, nb);
@@ -441,11 +455,10 @@ void RefreshProfile()
       int b = (int)((r[k].high - lo) / bin);
       a = MathMax(0, MathMin(nb - 1, a));
       b = MathMax(a, MathMin(nb - 1, b));
-      double v = (r[k].tick_volume > 0 ? (double)r[k].tick_volume : 1.0) / (b - a + 1);
+      double v = TickVol(r[k]) / (b - a + 1);
       for(int j = a; j <= b; j++)
          raw[j] += v;
      }
-   // 3-bin smoothing so single-bin noise does not count as a node.
    for(int j = 0; j < nb; j++)
       vol[j] = (raw[MathMax(0, j - 1)] + raw[j] + raw[MathMin(nb - 1, j + 1)]) / 3.0;
 
@@ -478,7 +491,86 @@ void RefreshProfile()
         }
   }
 
-// Distance from price to the nearest profile level in the trade direction.
+bool IsPivotHigh(const MqlRates &r[], int j, int k)
+  {
+   for(int m = 1; m <= k; m++)
+      if(r[j].high <= r[j - m].high || r[j].high < r[j + m].high)
+         return false;
+   return true;
+  }
+
+bool IsPivotLow(const MqlRates &r[], int j, int k)
+  {
+   for(int m = 1; m <= k; m++)
+      if(r[j].low >= r[j - m].low || r[j].low > r[j + m].low)
+         return false;
+   return true;
+  }
+
+// Walks the closed candles oldest to newest: confirms swings K candles after they form,
+// records a bullish (bearish) break when a candle CLOSES beyond the active swing high (low),
+// and keeps the swings that are still unbroken plus the newest unfilled FVG on each side.
+void BuildStructure(double atr)
+  {
+   MqlRates r[];
+   int n = CopyRates(_Symbol, PERIOD_M1, 1, InpStructBars, r);   // oldest first
+   int k = InpPivotK;
+   if(n < 2 * k + 3)
+      return;
+   double actH = 0.0, actL = 0.0;
+   int    dir = 0;
+   bool   choch = false;
+   for(int i = 0; i < n; i++)
+     {
+      int j = i - k;
+      if(j >= k)
+        {
+         if(IsPivotHigh(r, j, k))
+            actH = r[j].high;
+         if(IsPivotLow(r, j, k))
+            actL = r[j].low;
+        }
+      if(actH > 0.0 && r[i].close > actH)
+        { choch = dir < 0; dir = 1; actH = 0.0; }
+      if(actL > 0.0 && r[i].close < actL)
+        { choch = dir > 0; dir = -1; actL = 0.0; }
+     }
+   g_swH = actH;
+   g_swL = actL;
+   g_structDir = dir;
+   g_choch = choch;
+
+   double hi = -DBL_MAX, lo = DBL_MAX;
+   for(int i = MathMax(0, n - InpRangeBars); i < n; i++)
+     {
+      hi = MathMax(hi, r[i].high);
+      lo = MathMin(lo, r[i].low);
+     }
+   g_eq = (hi + lo) * 0.5;
+
+   g_bullTop = g_bullBot = g_bearTop = g_bearBot = 0.0;
+   for(int i = n - 1; i >= MathMax(2, n - InpFvgLookback); i--)
+     {
+      if(g_bullTop == 0.0 && r[i].low > r[i - 2].high && r[i].low - r[i - 2].high >= InpFvgMinAtr * atr)
+        {
+         bool filled = false;
+         for(int m = i + 1; m < n && !filled; m++)
+            filled = r[m].low <= r[i - 2].high;
+         if(!filled)
+           { g_bullTop = r[i].low; g_bullBot = r[i - 2].high; }
+        }
+      if(g_bearTop == 0.0 && r[i].high < r[i - 2].low && r[i - 2].low - r[i].high >= InpFvgMinAtr * atr)
+        {
+         bool filled = false;
+         for(int m = i + 1; m < n && !filled; m++)
+            filled = r[m].high >= r[i - 2].low;
+         if(!filled)
+           { g_bearTop = r[i - 2].low; g_bearBot = r[i].high; }
+        }
+     }
+  }
+
+// Distance from price to the nearest volume level (POC, VA edges, HVNs) in the trade direction.
 double RoomTo(int dir, double price, double atr)
   {
    double best = DBL_MAX, gap = 0.1 * atr;
@@ -515,23 +607,7 @@ double BufferValue(int handle, int shift)
 double Atr()     { return BufferValue(g_atr, 1); }
 double AtrSlow() { return BufferValue(g_atrSlow, 1); }
 
-// +1 up, -1 down, 0 = the filters disagree.
-int TrendDir(double price)
-  {
-   double f = BufferValue(g_emaF, 1), s = BufferValue(g_emaS, 1);
-   if(f <= 0.0 || s <= 0.0 || f == s)
-      return 0;
-   int dir = f > s ? 1 : -1;
-   if(g_htf != INVALID_HANDLE)
-     {
-      double e = BufferValue(g_htf, 1), c = iClose(_Symbol, InpHtfTF, 1);
-      if(e <= 0.0 || c <= 0.0 || (c > e ? 1 : -1) != dir)
-         return 0;
-     }
-   if(InpUseVwap && g_vwap > 0.0 && (price > g_vwap ? 1 : -1) != dir)
-      return 0;
-   return dir;
-  }
+double Clamp01(double x) { return MathMax(0.0, MathMin(1.0, x)); }
 
 double NormPrice(double p)
   {
@@ -566,8 +642,7 @@ double Lots(double riskDist)
    double ts = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
    if(tv <= 0.0 || ts <= 0.0)
       return 0.0;
-   double perLot = riskDist / ts * tv;
-   return NormLots(AccountInfoDouble(ACCOUNT_EQUITY) * InpRiskPercent / 100.0 / perLot);
+   return NormLots(AccountInfoDouble(ACCOUNT_EQUITY) * InpRiskPercent / 100.0 / (riskDist / ts * tv));
   }
 
 bool SelectOurPosition()
@@ -605,7 +680,6 @@ void RecoverPosition()
    g_riskDist  = g_slInitial > 0.0 ? MathAbs(g_entry - g_slInitial) : 0.0;
    g_openTime  = (datetime)PositionGetInteger(POSITION_TIME);
    g_lots      = PositionGetDouble(POSITION_VOLUME);
-   g_dir       = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? 1 : -1;
    g_setup     = "recovered";
    g_mfe = 0.0;
    g_mae = 0.0;
@@ -656,21 +730,118 @@ void Skip(int reason, const string status)
 
 void PrintReport()
   {
-   int n = g_setupN[0] + g_setupN[1];
-   int w = g_setupW[0] + g_setupW[1];
-   PrintFormat("=== MomentumScalper report: %d minutes scanned flat, %d trades, %d wins, %+.2f R ===",
-               g_minutesSeen, n, w, g_setupR[0] + g_setupR[1]);
-   for(int s = 0; s < 2; s++)
-      if(g_setupN[s] > 0)
-         PrintFormat("  %-8s %4d trades | win %.0f%% | %+.2f R | avg %+.3f R",
-                     g_setupName[s], g_setupN[s], 100.0 * g_setupW[s] / g_setupN[s],
-                     g_setupR[s], g_setupR[s] / g_setupN[s]);
+   int n = 0, w = 0;
+   double R = 0.0;
+   for(int t = 0; t < TRIG_COUNT; t++)
+     {
+      n += g_trigN[t];
+      w += g_trigW[t];
+      R += g_trigR[t];
+     }
+   PrintFormat("=== MomentumScalper v2 report: %d minutes scanned flat, %d trades, %d wins, %+.2f R ===",
+               g_minutesSeen, n, w, R);
+   for(int t = 0; t < TRIG_COUNT; t++)
+      if(g_trigN[t] > 0)
+         PrintFormat("  %-6s %4d trades | win %.0f%% | %+.2f R | avg %+.3f R",
+                     g_trigName[t], g_trigN[t], 100.0 * g_trigW[t] / g_trigN[t],
+                     g_trigR[t], g_trigR[t] / g_trigN[t]);
    if(g_ratioN > 0)
-      PrintFormat("Average M1 ATR / spread: %.2f (filter needs >= %.1f)", g_ratioSum / g_ratioN, InpMinAtrToSpread);
+      PrintFormat("Average M1 ATR / spread: %.2f (gate needs >= %.1f)", g_ratioSum / g_ratioN, InpMinAtrToSpread);
    for(int r = 0; r < SKIP_COUNT; r++)
       if(g_skipMin[r] > 0)
-         PrintFormat("  blocked by %-24s in %6d minutes (%.1f%%)", g_skipName[r], g_skipMin[r],
+         PrintFormat("  blocked by %-22s in %6d minutes (%.1f%%)", g_skipName[r], g_skipMin[r],
                      g_minutesSeen > 0 ? 100.0 * g_skipMin[r] / g_minutesSeen : 0.0);
+  }
+
+//+------------------------------------------------------------------+
+//| Triggers: returns the direction, sets the trigger index and a    |
+//| structural stop level (0 = none)                                 |
+//+------------------------------------------------------------------+
+int FindTrigger(const MqlTick &tk, double mid, double imb, double speedX, double atr, double spread,
+                int &trig, double &structStop)
+  {
+   datetime bar   = iTime(_Symbol, PERIOD_M1, 0);
+   double   chase = InpMaxChaseAtr * atr;
+   double   barLo = iLow(_Symbol, PERIOD_M1, 0);
+   double   barHi = iHigh(_Symbol, PERIOD_M1, 0);
+   structStop = 0.0;
+
+   // Liquidity sweep: wick through the unbroken swing, back inside, flow reclaiming.
+   if(InpUseSweep && g_trigUsed[2] != bar)
+     {
+      if(g_swL > 0.0 && barLo < g_swL && tk.bid > g_swL && tk.bid - g_swL <= chase && imb >= InpTrigMinFlow)
+        { trig = 2; structStop = barLo - 0.1 * atr; return 1; }
+      if(g_swH > 0.0 && barHi > g_swH && tk.bid < g_swH && g_swH - tk.bid <= chase && imb <= -InpTrigMinFlow)
+        { trig = 2; structStop = barHi + 0.1 * atr; return -1; }
+     }
+
+   // FVG: this candle tapped the gap and price is turning away from it.
+   if(InpUseFvg && g_trigUsed[3] != bar)
+     {
+      double then = MidSecondsAgo(3);
+      if(g_bullTop > 0.0 && barLo <= g_bullTop && tk.bid > g_bullBot && tk.bid - g_bullTop <= chase &&
+         then > 0.0 && mid > then && imb >= InpTrigMinFlow)
+        { trig = 3; structStop = MathMin(barLo, g_bullBot) - 0.1 * atr; return 1; }
+      if(g_bearBot > 0.0 && barHi >= g_bearBot && tk.ask < g_bearTop && g_bearBot - tk.ask <= chase &&
+         then > 0.0 && mid < then && imb <= -InpTrigMinFlow)
+        { trig = 3; structStop = MathMax(barHi, g_bearTop) + 0.1 * atr; return -1; }
+     }
+
+   // BOS / CHoCH: price trades through the last unbroken swing with flow.
+   if(InpUseBos && g_trigUsed[1] != bar)
+     {
+      if(g_swH > 0.0 && tk.bid > g_swH && tk.bid - g_swH <= chase && imb >= InpTrigMinFlow)
+        { trig = 1; return 1; }
+      if(g_swL > 0.0 && tk.bid < g_swL && g_swL - tk.bid <= chase && imb <= -InpTrigMinFlow)
+        { trig = 1; return -1; }
+     }
+
+   // Momentum burst: several spreads in a few seconds, one-sided and fast.
+   if(InpUseBurst && g_trigUsed[0] != bar)
+     {
+      double then = MidSecondsAgo(InpBurstSec);
+      double move = then > 0.0 ? mid - then : 0.0;
+      if(MathAbs(move) >= InpBurstMinSpreads * spread && MathAbs(move) <= InpBurstMaxAtr * atr &&
+         speedX >= InpBurstMinSpeedX)
+        {
+         int d = move > 0.0 ? 1 : -1;
+         if(d * imb >= InpTrigMinFlow)
+           { trig = 0; return d; }
+        }
+     }
+   return 0;
+  }
+
+//+------------------------------------------------------------------+
+//| Confluence score, 0-100                                          |
+//+------------------------------------------------------------------+
+int Score(int dir, double mid, double price, double imb, double speedX, double risk, double atr, string &detail)
+  {
+   int ema = 0, htf = 0, vwap = 0, bos = 0, pd = 0, poc = 0, room = 0;
+   double f = BufferValue(g_emaF, 1), s = BufferValue(g_emaS, 1);
+   if(f > 0.0 && s > 0.0 && (dir > 0 ? f > s : f < s))
+      ema = 15;
+   if(g_htf != INVALID_HANDLE)
+     {
+      double e = BufferValue(g_htf, 1), c = iClose(_Symbol, InpHtfTF, 1);
+      if(e > 0.0 && c > 0.0 && (dir > 0 ? c > e : c < e))
+         htf = 10;
+     }
+   if(g_vwap > 0.0 && (dir > 0 ? mid > g_vwap : mid < g_vwap))
+      vwap = 15;
+   if(g_structDir == dir)
+      bos = 10;
+   if(g_eq > 0.0 && (dir > 0 ? mid < g_eq : mid > g_eq))
+      pd = 5;
+   int flow  = (int)MathRound(20.0 * Clamp01(dir * imb / 0.6));
+   int speed = (int)MathRound(10.0 * Clamp01(speedX - 1.0));
+   if(g_poc > 0.0 && (dir > 0 ? mid > g_poc : mid < g_poc))
+      poc = 5;
+   if(RoomTo(dir, price, atr) >= InpRoomR * risk)
+      room = 10;
+   detail = StringFormat("ema %d htf %d vwap %d bos %d pd %d flow %d speed %d poc %d room %d",
+                         ema, htf, vwap, bos, pd, flow, speed, poc, room);
+   return ema + htf + vwap + bos + pd + flow + speed + poc + room;
   }
 
 //+------------------------------------------------------------------+
@@ -720,7 +891,8 @@ void TryEntry()
    if(InpMaxSpreadPts > 0 && spread > InpMaxSpreadPts * _Point)
      { Skip(SKIP_SPREAD, "spread too wide"); return; }
    if(atr < InpMinAtrToSpread * spread)
-     { Skip(SKIP_ATR, "M1 range too small for the spread"); return; }
+     { Skip(SKIP_ATR, StringFormat("M1 ATR only %.1fx the spread (gate %.1f)", spread > 0.0 ? atr / spread : 0.0,
+                                   InpMinAtrToSpread)); return; }
    if(InpMaxAtrSpikeX > 0.0 && atrSlow > 0.0 && atr > InpMaxAtrSpikeX * atrSlow)
      { Skip(SKIP_SPIKE, "volatility spike"); return; }
 
@@ -730,92 +902,52 @@ void TryEntry()
      { Skip(SKIP_FEED, "feed too slow"); return; }
    double speedX = baseRate > 0.0 ? rate / baseRate : 0.0;
    double mid    = (tk.bid + tk.ask) * 0.5;
-   int    trend  = TrendDir(mid);
-   if(InpRequireTrend && trend == 0)
-     { Skip(SKIP_NOTREND, "no clear trend"); return; }
 
-   int dir = 0, setupIdx = -1;
-
-   // 1. Momentum burst: a fast, one-sided move of several spreads in a few seconds.
-   if(InpUseBurst)
-     {
-      double then = MidSecondsAgo(InpBurstSec);
-      double move = then > 0.0 ? mid - then : 0.0;
-      if(MathAbs(move) >= InpBurstMinSpreads * spread && MathAbs(move) <= InpBurstMaxAtr * atr &&
-         speedX >= InpBurstMinSpeedX)
-        {
-         int d = move > 0.0 ? 1 : -1;
-         if(d * imb >= InpBurstMinFlow && (!InpRequireTrend || d == trend))
-           { dir = d; setupIdx = 0; }
-        }
-     }
-
-   // 2. Pullback continuation: swing in trend, a 0.3-1.2 ATR dip, then the last candle's
-   //    extreme breaks again while price is still below (above) the swing.
-   if(dir == 0 && InpUsePullback && trend != 0 && m != g_pbBar)
-     {
-      MqlRates r[];
-      int n = CopyRates(_Symbol, PERIOD_M1, 1, InpPbLookback, r);   // oldest first, r[n-1] = last closed
-      if(n == InpPbLookback)
-        {
-         int ext = 0;
-         for(int k = 1; k < n - 1; k++)
-            if(trend > 0 ? r[k].high > r[ext].high : r[k].low < r[ext].low)
-               ext = k;
-         double swing = trend > 0 ? r[ext].high : r[ext].low;
-         double far = swing;
-         for(int k = ext + 1; k < n; k++)
-            far = trend > 0 ? MathMin(far, r[k].low) : MathMax(far, r[k].high);
-         double depth = MathAbs(swing - far);
-         double trig  = trend > 0 ? r[n - 1].high : r[n - 1].low;
-         double px    = trend > 0 ? tk.bid : tk.ask;
-         bool broke   = trend > 0 ? (px > trig && px < swing && px - trig <= InpMaxChaseAtr * atr)
-                                  : (px < trig && px > swing && trig - px <= InpMaxChaseAtr * atr);
-         if(ext < n - 1 && depth >= InpPbMinAtr * atr && depth <= InpPbMaxAtr * atr && broke &&
-            trend * imb >= InpPbMinFlow)
-           { dir = trend; setupIdx = 1; g_pbBar = m; }
-        }
-     }
-
+   int    trig = -1;
+   double structStop = 0.0;
+   int    dir = FindTrigger(tk, mid, imb, speedX, atr, spread, trig, structStop);
    if(dir == 0)
      {
-      Skip(SKIP_NOSETUP, StringFormat("scanning | trend %s | flow %+.2f | speed %.1fx",
-                                      trend > 0 ? "up" : (trend < 0 ? "down" : "mixed"), imb, speedX));
+      Skip(SKIP_NOTRIG, StringFormat("waiting for a trigger | flow %+.2f | speed %.1fx", imb, speedX));
       return;
      }
 
-   // Stop on the far side of the spread: risk = stop distance + spread.
+   // Stop: ATR based, at least N spreads, pushed beyond the sweep wick / FVG if wider, capped.
+   double price  = dir > 0 ? tk.ask : tk.bid;
+   double ref    = dir > 0 ? tk.bid : tk.ask;
    double slDist = MathMax(InpSlAtr * atr, InpSlMinSpreads * spread);
+   if(InpStructSl && structStop > 0.0)
+      slDist = MathMax(slDist, MathAbs(ref - structStop));
+   slDist = MathMin(slDist, MathMax(InpSlMaxAtr * atr, InpSlMinSpreads * spread));
    slDist = MathMax(slDist, (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point + spread);
-   double price = dir > 0 ? tk.ask : tk.bid;
-   double sl    = dir > 0 ? NormPrice(tk.bid - slDist) : NormPrice(tk.ask + slDist);
-   double risk  = MathAbs(price - sl);
+   double sl   = NormPrice(dir > 0 ? ref - slDist : ref + slDist);
+   double risk = MathAbs(price - sl);
 
-   // Volume profile: right side of POC and room to the next level.
-   double room = DBL_MAX;
-   if(InpUseProfile && g_poc > 0.0)
+   string detail;
+   int score = Score(dir, mid, price, imb, speedX, risk, atr, detail);
+   g_lastCand = StringFormat("%s %s score %d/%d: %s", g_trigName[trig], dir > 0 ? "long" : "short",
+                             score, InpMinScore, detail);
+   if(score < InpMinScore)
      {
-      if(InpProfileBias && (dir > 0 ? mid < g_poc : mid > g_poc))
-        { Skip(SKIP_PROFILE, "wrong side of POC"); return; }
-      room = RoomTo(dir, price, atr);
-      if(room < InpMinRoomR * risk)
-        { Skip(SKIP_ROOM, StringFormat("only %.1fR of room to the next volume level", room / risk)); return; }
+      Skip(SKIP_SCORE, g_lastCand);
+      return;
      }
 
    double lots = Lots(risk);
    if(lots <= 0.0)
      { Skip(SKIP_FAILED, "lot size below minimum"); return; }
    double tp = InpTpR > 0.0 ? NormPrice(dir > 0 ? price + InpTpR * risk : price - InpTpR * risk) : 0.0;
-   string setup = g_setupName[setupIdx];
+   string setup = g_trigName[trig];
 
    bool ok = dir > 0 ? trade.Buy(lots, _Symbol, tk.ask, sl, tp, "MS " + setup)
                      : trade.Sell(lots, _Symbol, tk.bid, sl, tp, "MS " + setup);
+   g_trigUsed[trig] = m;
    if(!ok || (trade.ResultRetcode() != TRADE_RETCODE_DONE && trade.ResultRetcode() != TRADE_RETCODE_PLACED))
      {
       Skip(SKIP_FAILED, "order rejected");
       PrintFormat("%s %s failed: %d %s", setup, dir > 0 ? "BUY" : "SELL",
                   trade.ResultRetcode(), trade.ResultRetcodeDescription());
-      g_lastExit = now;          // back off before retrying
+      g_lastExit = now;
       return;
      }
 
@@ -823,13 +955,12 @@ void TryEntry()
    g_entryTimes[g_entryIdx] = now;
    g_entryIdx = (g_entryIdx + 1) % 64;
    g_setup = setup;
-   g_dir = dir;
    g_slInitial = sl;
    g_spreadEntry = spread;
    g_atrEntry = atr;
    g_flowEntry = imb;
    g_speedEntry = speedX;
-   g_roomEntry = room == DBL_MAX ? 0.0 : room / risk;
+   g_scoreEntry = score;
    g_mfe = 0.0;
    g_mae = 0.0;
    g_lots = lots;
@@ -845,13 +976,10 @@ void TryEntry()
      }
    g_riskDist = MathAbs(g_entry - sl);
    if(InpVerbose)
-      PrintFormat("ENTRY %s %s %.2f @ %s | SL %s TP %s | risk %.2f (%.1f spreads) | flow %+.2f speed %.1fx | "
-                  "POC %s VWAP %s room %s",
+      PrintFormat("ENTRY %s %s %.2f @ %s | SL %s TP %s | risk %.2f (%.1f spreads) | score %d (%s)",
                   setup, dir > 0 ? "BUY" : "SELL", lots, DoubleToString(g_entry, _Digits),
                   DoubleToString(sl, _Digits), tp > 0.0 ? DoubleToString(tp, _Digits) : "-",
-                  g_riskDist, spread > 0.0 ? g_riskDist / spread : 0.0, imb, speedX,
-                  DoubleToString(g_poc, _Digits), DoubleToString(g_vwap, _Digits),
-                  room == DBL_MAX ? "open" : StringFormat("%.1fR", room / risk));
+                  g_riskDist, spread > 0.0 ? g_riskDist / spread : 0.0, score, detail);
   }
 
 //+------------------------------------------------------------------+
@@ -926,9 +1054,8 @@ void ManagePosition()
   }
 
 //+------------------------------------------------------------------+
-//| Optimizer score ("Custom max" in the tester): net profit over    |
-//| max equity drawdown, scaled by sample size. Runs with fewer than |
-//| InpOptMinTrades trades score 0, so lucky handfuls cannot win.    |
+//| Optimizer score ("Custom max"): net profit over max equity       |
+//| drawdown, scaled by sample size; 0 below InpOptMinTrades.        |
 //+------------------------------------------------------------------+
 double OnTester()
   {
@@ -976,14 +1103,14 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
                 reason == DEAL_REASON_SO ? "stop_out" :
                 reason == DEAL_REASON_EXPERT ? (g_closeWhy != "" ? g_closeWhy : "ea") : "manual";
 
-   int s = g_setup == "burst" ? 0 : (g_setup == "pullback" ? 1 : -1);
-   if(s >= 0)
-     {
-      g_setupN[s]++;
-      g_setupR[s] += r;
-      if(pnl > 0.0)
-         g_setupW[s]++;
-     }
+   for(int t = 0; t < TRIG_COUNT; t++)
+      if(g_setup == g_trigName[t])
+        {
+         g_trigN[t]++;
+         g_trigR[t] += r;
+         if(pnl > 0.0)
+            g_trigW[t]++;
+        }
    if(pnl < 0.0)
      {
       g_consecLosses++;
@@ -1025,7 +1152,7 @@ void LogTrade(ulong deal, double pnl, bool wasLong, const string why)
      }
    if(FileSize(h) == 0)
       FileWrite(h, "open_time", "close_time", "symbol", "side", "setup", "lots", "entry", "exit",
-                "sl_initial", "risk", "spread", "atr", "flow_imb", "speed_x", "room_r",
+                "sl_initial", "risk", "spread", "atr", "flow_imb", "speed_x", "score",
                 "mfe", "mae", "exit_reason", "pnl");
    FileSeek(h, 0, SEEK_END);
    FileWrite(h,
@@ -1041,7 +1168,7 @@ void LogTrade(ulong deal, double pnl, bool wasLong, const string why)
              DoubleToString(g_atrEntry, _Digits),
              DoubleToString(g_flowEntry, 3),
              DoubleToString(g_speedEntry, 2),
-             DoubleToString(g_roomEntry, 2),
+             IntegerToString(g_scoreEntry),
              DoubleToString(g_mfe, _Digits),
              DoubleToString(g_mae, _Digits),
              why,
@@ -1057,27 +1184,39 @@ void ShowPanel()
       return;
    double imb, rate, baseRate;
    Flow(InpBurstSec, imb, rate, baseRate);
-   double atr = Atr(), spread = tk.ask - tk.bid, mid = (tk.bid + tk.ask) * 0.5;
-   double then = MidSecondsAgo(InpBurstSec);
-   int    trend = TrendDir(mid);
-   int    n = g_setupN[0] + g_setupN[1];
+   double atr = Atr(), spread = tk.ask - tk.bid;
+   int n = 0, w = 0;
+   double R = 0.0;
+   for(int t = 0; t < TRIG_COUNT; t++)
+     {
+      n += g_trigN[t];
+      w += g_trigW[t];
+      R += g_trigR[t];
+     }
    Comment(StringFormat(
-              "MomentumScalper  %s\n"
-              "Spread %s | M1 ATR %s | ATR/spread %.1f (need %.1f)\n"
-              "Trend %s | VWAP %s | POC %s | VA %s - %s\n"
-              "Last %ds: move %s | flow %+.2f (%s) | speed %.1fx | feed %.2f t/s\n"
+              "MomentumScalper v2  %s\n"
+              "Spread %s | M1 ATR %s | ATR/spread %.1f (gate %.1f) | flow %+.2f (%s) | speed %.1fx\n"
+              "VWAP %s | POC %s | VA %s - %s\n"
+              "Structure: last break %s%s | swing H %s | swing L %s | EQ %s\n"
+              "FVG bull %s - %s | FVG bear %s - %s\n"
+              "Last candidate: %s\n"
               "Today %d trades, last hour %d/%d | session %d trades, %d wins, %+.2fR | streak %d\n"
-              "%s",
+              "Status: %s",
               _Symbol,
               DoubleToString(spread, _Digits), DoubleToString(atr, _Digits),
-              spread > 0.0 ? atr / spread : 0.0, InpMinAtrToSpread,
-              trend > 0 ? "UP" : (trend < 0 ? "DOWN" : "mixed"),
+              spread > 0.0 ? atr / spread : 0.0, InpMinAtrToSpread, imb,
+              g_hasAggFlags ? "aggressor" : "tick rule", baseRate > 0.0 ? rate / baseRate : 0.0,
               DoubleToString(g_vwap, _Digits), DoubleToString(g_poc, _Digits),
               DoubleToString(g_val, _Digits), DoubleToString(g_vah, _Digits),
-              InpBurstSec, then > 0.0 ? DoubleToString(mid - then, _Digits) : "-",
-              imb, g_hasAggFlags ? "aggressor" : "tick rule", baseRate > 0.0 ? rate / baseRate : 0.0, baseRate,
-              g_tradesToday, EntriesLastHour(), InpMaxTradesPerHour,
-              n, g_setupW[0] + g_setupW[1], g_setupR[0] + g_setupR[1], g_consecLosses,
+              g_structDir > 0 ? "BULLISH" : (g_structDir < 0 ? "BEARISH" : "none"), g_choch ? " (CHoCH)" : "",
+              g_swH > 0.0 ? DoubleToString(g_swH, _Digits) : "-", g_swL > 0.0 ? DoubleToString(g_swL, _Digits) : "-",
+              DoubleToString(g_eq, _Digits),
+              g_bullTop > 0.0 ? DoubleToString(g_bullBot, _Digits) : "-",
+              g_bullTop > 0.0 ? DoubleToString(g_bullTop, _Digits) : "-",
+              g_bearTop > 0.0 ? DoubleToString(g_bearBot, _Digits) : "-",
+              g_bearTop > 0.0 ? DoubleToString(g_bearTop, _Digits) : "-",
+              g_lastCand == "" ? "none yet" : g_lastCand,
+              g_tradesToday, EntriesLastHour(), InpMaxTradesPerHour, n, w, R, g_consecLosses,
               g_status));
   }
 //+------------------------------------------------------------------+

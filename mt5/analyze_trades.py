@@ -66,7 +66,7 @@ def main(path: str) -> None:
     print(f"stopped out          : {(df.exit_reason == 'stop').mean() * 100:.0f}% of trades")
 
     print("\n--- does the signal strength matter? (avg R by quartile) ---")
-    for col in ("flow_imb", "speed_x", "book_imb", "room_r"):
+    for col in ("flow_imb", "speed_x", "book_imb", "room_r", "score"):
         if col not in df:
             continue
         x = df[col].abs() if col in ("flow_imb", "book_imb") else df[col]

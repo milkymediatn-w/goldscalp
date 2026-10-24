@@ -112,25 +112,56 @@ Optimise only a few inputs at a time, for example `InpMinFlowImb`, `InpSlAtr`, `
 
 ---
 
-# MomentumScalper: high-frequency trend + momentum scalper
+# MomentumScalper v2: momentum + price action + VWAP + SMC scalper
 
 `Experts/MomentumScalper.mq5`. It checks for entries on **every tick** and holds trades for
 seconds to a few minutes. There is one position at a time. There is no martingale, grid or
 averaging down.
 
-| Part | How it works |
-|---|---|
-| **Trend** | The M1 EMA 9 must be above the EMA 21 for longs (below for shorts). An M5 EMA50 filter and a rolling VWAP must agree. Set `InpRequireTrend=false` to trade both ways. |
-| **Burst setup** | Price moves at least `InpBurstMinSpreads` spreads in `InpBurstSec` seconds, with one-sided flow (`InpBurstMinFlow`) and tick speed of at least `InpBurstMinSpeedX`. It is skipped if the move is already larger than `InpBurstMaxAtr` ATR. |
-| **Pullback setup** | In trend, price dips `InpPbMinAtr`–`InpPbMaxAtr` ATR from the last swing, then breaks the last closed M1 candle's extreme again, with flow agreeing. |
-| **Volume profile** | A rolling profile of the last `InpProfileBars` M1 candles' tick volume gives the POC, value area and HVNs. Longs need price above the POC (shorts below), and at least `InpMinRoomR` R of room to the next level. |
-| **Exits** | Stop of `InpSlAtr` ATR (at least `InpSlMinSpreads` spreads), TP at `InpTpR` R, break-even at `InpBreakEvenR`, ATR trail from `InpTrailStartR`, a time stop after `InpMaxHoldSec`, and a flow-fade exit when flow turns hard against the trade. |
-| **Frequency guards** | `InpCooldownSec` between trades, `InpMaxTradesPerHour`, `InpMaxTradesPerDay`, a losing-streak pause and a daily loss limit. |
+An entry needs **one trigger** plus a **confluence score** of at least `InpMinScore`
+(default 55 out of 100). The panel shows the last candidate's score breakdown, so you can always
+see why it did or did not trade.
 
-The log is written to `MQL5/Files/MomentumScalper_<symbol>.csv`; analyse it with
-`analyze_trades.py`. When the EA stops, it prints per-setup results and which filter blocked
-trading, minute by minute.
+| Trigger | Condition (flow must agree by `InpTrigMinFlow`) |
+|---|---|
+| `burst` | Price moves at least `InpBurstMinSpreads` spreads in `InpBurstSec` seconds, with tick speed of at least `InpBurstMinSpeedX` |
+| `bos` | Price trades through the last unbroken M1 swing high or low (break of structure, or CHoCH if it flips direction) |
+| `sweep` | This candle wicks through an unbroken swing (a liquidity grab), then price reclaims it |
+| `fvg` | This candle taps the newest unfilled fair value gap and price turns away from it |
+
+| Score item | Points |
+|---|---|
+| M1 EMA 9/21 trend | 15 |
+| M5 EMA50 trend | 10 |
+| Correct side of the rolling VWAP | 15 |
+| Last structure break in the trade direction | 10 |
+| Discount for longs, premium for shorts (60-candle dealing range) | 5 |
+| Flow strength | 0–20 |
+| Tick speed | 0–10 |
+| Correct side of the volume-profile POC | 5 |
+| At least `InpRoomR` R of room to the next volume level | 10 |
+
+**Hard gates:**
+- M1 ATR must be at least `InpMinAtrToSpread` × spread;
+- no volatility spike;
+- the feed must not be too slow;
+- daily loss limit, trades per hour and per day, cooldown, losing-streak pause.
+
+**Exits:**
+- ATR stop of at least `InpSlMinSpreads` spreads. On sweep and FVG trades it sits beyond the wick
+  or gap, capped at `InpSlMaxAtr`.
+- TP at `InpTpR` R.
+- Break-even, then an ATR trail.
+- A time stop, and an exit when flow turns hard against the trade.
+
+**Presets** (load them in the Strategy Tester **Inputs** tab: right-click → Load; they cannot be
+compiled):
+- `Presets/MomentumScalper_HighWinRate.set`: small target, wide stop, early break-even.
+- `Presets/MomentumScalper_Optimize.set`: ranges for the genetic optimiser. Use "Custom max" and
+  Forward 1/3.
+
+The log goes to `MQL5/Files/MomentumScalper_<symbol>.csv`; analyse it with `analyze_trades.py`.
 
 Every trade pays the full spread, so more trades means more cost. On Exness BTCUSDm ($6.40 spread)
-a stop of 2.5 spreads means the spread alone is about 0.3R per trade. The setups must win more
-than that back on average. The tester decides; nothing here is profitable until it does.
+a 3-spread stop means the spread alone is about 0.25R per trade. The tester decides; nothing here
+is profitable until it does.
