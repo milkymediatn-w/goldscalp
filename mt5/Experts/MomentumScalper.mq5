@@ -109,6 +109,10 @@ input int    InpSessionStartHour  = 0;      // Start hour
 input int    InpSessionEndHour    = 24;     // End hour (exclusive)
 input bool   InpTradeWeekends     = true;   // Trade Saturday and Sunday
 
+//--- optimisation
+input group "Optimisation"
+input int    InpOptMinTrades      = 200;    // Custom optimizer score needs at least this many trades
+
 //--- tick ring: one bucket per second
 #define RING 900
 long   g_secStamp[RING];
@@ -919,6 +923,23 @@ void ManagePosition()
       return;
    if(!trade.PositionModify(ticket, newSl, tp))
       PrintFormat("Stop modify failed: %d %s", trade.ResultRetcode(), trade.ResultRetcodeDescription());
+  }
+
+//+------------------------------------------------------------------+
+//| Optimizer score ("Custom max" in the tester): net profit over    |
+//| max equity drawdown, scaled by sample size. Runs with fewer than |
+//| InpOptMinTrades trades score 0, so lucky handfuls cannot win.    |
+//+------------------------------------------------------------------+
+double OnTester()
+  {
+   double trades = TesterStatistics(STAT_TRADES);
+   double net    = TesterStatistics(STAT_PROFIT);
+   double dd     = TesterStatistics(STAT_EQUITY_DD);
+   if(trades < InpOptMinTrades)
+      return 0.0;
+   if(net <= 0.0)
+      return net;
+   return net / MathMax(dd, 1.0) * MathSqrt(trades / InpOptMinTrades);
   }
 
 //+------------------------------------------------------------------+
