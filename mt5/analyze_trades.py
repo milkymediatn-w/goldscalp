@@ -1,7 +1,8 @@
 """
-Analyse the CSV written by ScalpEngine (MQL5/Files/ScalpEngine_<symbol>.csv).
+Analyse the CSV written by ScalpEngine or MomentumScalper
+(MQL5/Files/ScalpEngine_<symbol>.csv or MomentumScalper_<symbol>.csv).
 
-    python mt5/analyze_trades.py ScalpEngine_BTCUSDm.csv
+    python mt5/analyze_trades.py MomentumScalper_BTCUSDm.csv
 
 Prints expectancy in R (risk units) overall, per setup, per exit reason and per
 hour, plus MFE/MAE so you can tell whether the trail is too tight or the stop
@@ -65,8 +66,10 @@ def main(path: str) -> None:
     print(f"stopped out          : {(df.exit_reason == 'stop').mean() * 100:.0f}% of trades")
 
     print("\n--- does the signal strength matter? (avg R by quartile) ---")
-    for col in ("flow_imb", "speed_x", "book_imb"):
-        x = df[col].abs() if col != "speed_x" else df[col]
+    for col in ("flow_imb", "speed_x", "book_imb", "room_r"):
+        if col not in df:
+            continue
+        x = df[col].abs() if col in ("flow_imb", "book_imb") else df[col]
         if x.nunique() < 4:
             continue
         q = pd.qcut(x, 4, duplicates="drop")

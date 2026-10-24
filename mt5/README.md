@@ -109,3 +109,28 @@ Optimise only a few inputs at a time, for example `InpMinFlowImb`, `InpSlAtr`, `
   crypto.
 - v1 compiled with 0 errors in MetaEditor; v2 still needs its first compile.
 - Nothing here is profitable until the tester and a demo account say so.
+
+---
+
+# MomentumScalper: high-frequency trend + momentum scalper
+
+`Experts/MomentumScalper.mq5`. It checks for entries on **every tick** and holds trades for
+seconds to a few minutes. There is one position at a time. There is no martingale, grid or
+averaging down.
+
+| Part | How it works |
+|---|---|
+| **Trend** | The M1 EMA 9 must be above the EMA 21 for longs (below for shorts). An M5 EMA50 filter and a rolling VWAP must agree. Set `InpRequireTrend=false` to trade both ways. |
+| **Burst setup** | Price moves at least `InpBurstMinSpreads` spreads in `InpBurstSec` seconds, with one-sided flow (`InpBurstMinFlow`) and tick speed of at least `InpBurstMinSpeedX`. It is skipped if the move is already larger than `InpBurstMaxAtr` ATR. |
+| **Pullback setup** | In trend, price dips `InpPbMinAtr`–`InpPbMaxAtr` ATR from the last swing, then breaks the last closed M1 candle's extreme again, with flow agreeing. |
+| **Volume profile** | A rolling profile of the last `InpProfileBars` M1 candles' tick volume gives the POC, value area and HVNs. Longs need price above the POC (shorts below), and at least `InpMinRoomR` R of room to the next level. |
+| **Exits** | Stop of `InpSlAtr` ATR (at least `InpSlMinSpreads` spreads), TP at `InpTpR` R, break-even at `InpBreakEvenR`, ATR trail from `InpTrailStartR`, a time stop after `InpMaxHoldSec`, and a flow-fade exit when flow turns hard against the trade. |
+| **Frequency guards** | `InpCooldownSec` between trades, `InpMaxTradesPerHour`, `InpMaxTradesPerDay`, a losing-streak pause and a daily loss limit. |
+
+The log is written to `MQL5/Files/MomentumScalper_<symbol>.csv`; analyse it with
+`analyze_trades.py`. When the EA stops, it prints per-setup results and which filter blocked
+trading, minute by minute.
+
+Every trade pays the full spread, so more trades means more cost. On Exness BTCUSDm ($6.40 spread)
+a stop of 2.5 spreads means the spread alone is about 0.3R per trade. The setups must win more
+than that back on average. The tester decides; nothing here is profitable until it does.
