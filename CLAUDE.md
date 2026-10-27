@@ -6,8 +6,27 @@ public data only. Not for resale or signal selling. Full source documents are in
 | File | What it covers |
 |---|---|
 | `docs/handoffs/PROJECT_BRIEF.md` | The original brief: what was tested, what lost, the rules for the next attempt |
-| `docs/handoffs/orderflow-bot.md` | Handoff from a claude.ai chat: Binance order-flow Telegram bot (separate codebase) |
+| `docs/handoffs/orderflow-bot.md` | Handoff from a claude.ai chat: Binance order-flow Telegram bot (code now in `orderflow/`) |
 | `docs/handoffs/grid-ea.md` | Handoff from a claude.ai chat: grid/martingale EA for XAUUSD (separate codebase) |
+
+## Current focus: order-flow Telegram signals bot (`orderflow/`)
+
+A private signal bot that reads real order flow (Level 2 book, aggressor-side trades, delta,
+footprint, volume profile, absorption) to confirm SMC setups (sweeps, FVG, CHoCH), and sends
+alerts to ONE private Telegram chat. The user trades the signals manually on MT5.
+**Read `orderflow/CLAUDE.md` before working on it**: it holds the hard rules (one chat only, no
+API keys, never commit `.env` or `data/`) and the architecture (adapter → events → engine →
+notifier).
+
+- Phase 1 (live Binance USD-M `BTCUSDT` data, order-book sync, hourly recording, replay, hourly
+  Telegram summary) is built. Offline tests: `cd orderflow && python -m pytest -q` (5 pass).
+  **Never run against live Binance yet.** This cloud environment's network policy blocks
+  `fapi.binance.com` / `fstream.binance.com`, so the first live run happens on the user's PC or VPS.
+- The 2026 split WebSocket endpoints (`/market/stream`, `/public/stream`) come from the earlier
+  chat and are unverified here; the first live run confirms them.
+- Next: first live run and a few London/New York sessions of recordings, then Phase 2 builders
+  (footprint bars, cumulative delta, session volume profile, book imbalance, absorption), then SMC
+  detection confirmed by order flow, alert-only mode, and a replay backtest.
 
 ## Broker and accounts
 
@@ -30,10 +49,10 @@ MomentumScalper v2.1 and ScalpEngine v1/v2 lost money on BTCUSDm and XAUUSDm. v2
 +$0.013 per trade before costs against $0.10 spread (0.01 lot). Seconds-to-minutes holds with
 quote-only signals do not cover Standard-account costs, and more tuning would only curve-fit.
 
-## Current direction (this repo)
+## MT5 EAs (on hold while the order-flow bot is the focus)
 
-The user wants a **fast M1 scalper, every trade closed within 10 minutes**, as an `.mq5` EA on
-their own terminal, BTC first, on the **Pro** account.
+A **fast M1 scalper, every trade closed within 10 minutes**, as an `.mq5` EA on the user's own
+terminal, BTC first, on the **Pro** account.
 
 | File | Status |
 |---|---|
@@ -43,7 +62,8 @@ their own terminal, BTC first, on the **Pro** account.
 | `mt5/analyze_probe.py` | Slices the SetupProbe CSV. |
 | `mt5/analyze_trades.py` | Reads the EA trade logs (`FastScalper_<symbol>.csv` and older EAs). |
 | `mt5/Experts/ScalpEngine.mq5`, `MomentumScalper.mq5` | Older EAs, both lost money. Kept for reference. |
-| Root: `bot.py`, `strategy.py`, `data.py`, `config.py`, `backtest.py` | Older Telegram signal bot (yfinance / Twelve Data / MT5 feed). Results were poor. |
+| `orderflow/` | **The new order-flow signals bot (current focus).** See its `CLAUDE.md`. |
+| Root: `bot.py`, `strategy.py`, `data.py`, `config.py`, `backtest.py` | Older Telegram signal bot (yfinance / Twelve Data / MT5 feed, candle-approximated delta). Results were poor; replaced by `orderflow/`. |
 
 FastScalper setups (M1 candle close; the same maths as SetupProbe):
 - `A_squeeze`: a tight range, then an expansion candle breaks out of it.
@@ -81,13 +101,6 @@ position size after adverse moves, which rule 3 of the brief forbids. It has no 
 compile confirmation. Before any work on it, the user decides which rule set applies. If it goes
 ahead, judge it on 3+ years of real ticks by profit factor after costs, hard-stop count and max
 drawdown in trending periods, never by win rate.
-
-## Other project: order-flow Telegram bot (separate codebase)
-
-`docs/handoffs/orderflow-bot.md`: Python, Binance USD-M `BTCUSDT` public streams (no API key),
-adapter → events → engine → notifier, records hourly gzip JSONL for replay, alerts to one private
-Telegram chat. Phase 1 is built but never run live. Its code is not in this repo. The gold-data
-route (Databento vs Bookmap/dxFeed) is still open.
 
 ## Working conventions
 
