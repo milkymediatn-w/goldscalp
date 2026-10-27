@@ -43,7 +43,7 @@ for BTCUSDm.
 ## Protections
 
 - **Cost gate:** the candle's ATR must be at least `InpMinAtrToSpread` times the spread, and the
-  stop must be at least `InpSlMinCosts` round-trip costs.
+  stop must be at least `InpSlMinSpreads` spreads.
 - **Regime filters:** skip volatility spikes (ATR(14) above `InpMaxAtrSpikeX` times ATR(100)) and
   slow feeds (below `InpMinTickRate` ticks per second).
 - **Sizing:** position size from risk % of equity, with a lot cap.
@@ -148,7 +148,7 @@ see why it did or did not trade.
 - daily loss limit, trades per hour and per day, cooldown, losing-streak pause.
 
 **Exits:**
-- ATR stop of at least `InpSlMinCosts` round-trip costs. On sweep and FVG trades it sits beyond the wick
+- ATR stop of at least `InpSlMinSpreads` spreads. On sweep and FVG trades it sits beyond the wick
   or gap, capped at `InpSlMaxAtr`.
 - TP at `InpTpR` R.
 - Break-even, then an ATR trail.
