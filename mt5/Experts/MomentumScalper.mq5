@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| MomentumScalper.mq5  v2                                          |
+//| MomentumScalper.mq5  v2.1                                        |
 //| High-frequency momentum + price-action + VWAP + SMC scalper      |
 //| for MT5 (built around Exness BTCUSDm). Decides on every tick,    |
 //| holds seconds to a few minutes, one position at a time.          |
@@ -23,7 +23,7 @@
 //| Closed trades: MQL5/Files/MomentumScalper_<symbol>.csv           |
 //+------------------------------------------------------------------+
 #property copyright "goldscalp"
-#property version   "2.00"
+#property version   "2.10"
 #property description "HF momentum + price action + VWAP + SMC scalper (trigger + confluence score)"
 
 #include <Trade/Trade.mqh>
@@ -40,7 +40,7 @@ input group "Risk"
 input double InpRiskPercent       = 0.0;    // Risk per trade, % of equity (0 = fixed lots)
 input double InpFixedLots         = 0.01;   // Fixed lots when risk % is 0
 input double InpMaxLots           = 1.0;    // Hard cap on lots
-input double InpMaxDailyLossPct   = 3.0;    // Stop for the day after this equity drawdown %
+input double InpMaxDailyLossPct   = 5.0;    // Stop for the day after this equity drawdown %
 input int    InpMaxTradesPerDay   = 200;    // Max entries per server day
 input int    InpMaxTradesPerHour  = 25;     // Max entries per rolling hour
 input int    InpCooldownSec       = 10;     // Wait after any exit, seconds
@@ -50,7 +50,7 @@ input int    InpLossPauseMin      = 15;     // Pause length, minutes
 //--- hard gates
 input group "Hard gates"
 input int    InpMaxSpreadPts      = 0;      // Max spread, points (0 = off)
-input double InpMinAtrToSpread    = 2.0;    // M1 ATR must be >= this x spread
+input double InpMinAtrToSpread    = 3.5;    // M1 ATR must be >= this x spread
 input double InpMaxAtrSpikeX      = 3.5;    // Skip when M1 ATR(14) > this x ATR(100)
 input double InpMinTickRate       = 0.1;    // Skip when the feed is slower than this, ticks/s
 
@@ -61,7 +61,7 @@ input bool   InpUseBos            = true;   // Break of structure / CHoCH
 input bool   InpUseSweep          = true;   // Liquidity sweep and reclaim
 input bool   InpUseFvg            = true;   // Fair value gap tap and bounce
 input int    InpBurstSec          = 8;      // Burst look-back, seconds (also the flow window)
-input double InpBurstMinSpreads   = 1.2;    // Burst: move >= this many spreads in the look-back
+input double InpBurstMinSpreads   = 1.8;    // Burst: move >= this many spreads in the look-back
 input double InpBurstMaxAtr       = 1.2;    // Burst: ...but <= this x ATR (overextended)
 input double InpBurstMinSpeedX    = 1.2;    // Burst: tick speed >= this x 10-min average
 input double InpTrigMinFlow       = 0.25;   // Every trigger: flow must agree by at least this
@@ -77,7 +77,7 @@ input int    InpFvgLookback       = 20;     // FVGs younger than this many candl
 
 //--- confluence
 input group "Confluence score"
-input int    InpMinScore          = 55;     // Min score (0-100) to enter
+input int    InpMinScore          = 65;     // Min score (0-100) to enter
 input int    InpEmaFast           = 9;      // M1 fast EMA
 input int    InpEmaSlow           = 21;     // M1 slow EMA
 input ENUM_TIMEFRAMES InpHtfTF    = PERIOD_M5; // Higher timeframe
@@ -96,8 +96,8 @@ input double InpTpR               = 1.0;    // Take profit in R (0 = none, trail
 input double InpBreakEvenR        = 0.5;    // Move stop to entry at +R (0 = off)
 input double InpTrailStartR       = 0.8;    // Start trailing at +R (0 = off)
 input double InpTrailAtr          = 0.6;    // Trail distance, x ATR
-input int    InpMaxHoldSec        = 240;    // Time stop, seconds (0 = off)
-input bool   InpFlowExit          = true;   // Exit when flow turns hard against the trade
+input int    InpMaxHoldSec        = 300;    // Time stop, seconds (0 = off)
+input bool   InpFlowExit          = false;  // Exit when flow turns hard against the trade (cut 74% of trades in v2 tests)
 input double InpExitFlow          = 0.55;   // ...imbalance against
 input int    InpFlowExitMinSec    = 10;     // ...only after holding this long
 input double InpFlowExitMaxR      = 0.3;    // ...and only while profit is below this R
@@ -155,6 +155,7 @@ string   g_closeWhy = "";
 string   g_status = "";
 string   g_lastCand = "";
 datetime g_trigUsed[4];
+datetime g_flatSince = 0;
 
 //--- open trade context
 ulong    g_posTicket = 0;
@@ -233,7 +234,7 @@ int OnInit()
    PullTicks();
    RecoverPosition();
    EventSetTimer(1);
-   PrintFormat("MomentumScalper v2 on %s | min score %d | stop %.1fxATR (min %.1f spreads, max %.1fxATR) | "
+   PrintFormat("MomentumScalper v2.1 on %s | min score %d | stop %.1fxATR (min %.1f spreads, max %.1fxATR) | "
                "TP %.1fR | BE %.1fR | trail from %.1fR | time stop %ds | %s",
                _Symbol, InpMinScore, InpSlAtr, InpSlMinSpreads, InpSlMaxAtr, InpTpR, InpBreakEvenR,
                InpTrailStartR, InpMaxHoldSec,
@@ -738,7 +739,7 @@ void PrintReport()
       w += g_trigW[t];
       R += g_trigR[t];
      }
-   PrintFormat("=== MomentumScalper v2 report: %d minutes scanned flat, %d trades, %d wins, %+.2f R ===",
+   PrintFormat("=== MomentumScalper v2.1 report: %d minutes scanned flat, %d trades, %d wins, %+.2f R ===",
                g_minutesSeen, n, w, R);
    for(int t = 0; t < TRIG_COUNT; t++)
       if(g_trigN[t] > 0)
@@ -849,9 +850,22 @@ int Score(int dir, double mid, double price, double imb, double speedX, double r
 //+------------------------------------------------------------------+
 void TryEntry()
   {
-   if(SelectOurPosition())
-     { g_status = "in position"; return; }
    datetime now = TimeCurrent();
+   if(SelectOurPosition())
+     { g_status = "in position"; g_flatSince = 0; return; }
+   // A position just closed but its exit transaction (which records the result and starts
+   // the cooldown) has not been processed yet: entering now would mislabel that exit.
+   if(g_setup != "")
+     {
+      if(g_flatSince == 0)
+         g_flatSince = now;
+      if(now - g_flatSince < 5)
+        { g_status = "settling the last exit"; return; }
+      g_setup = "";
+      g_riskDist = 0.0;
+      g_atrEntry = 0.0;
+     }
+   g_flatSince = 0;
    datetime m   = iTime(_Symbol, PERIOD_M1, 0);
    if(m != g_lastSeenMin)
      {
@@ -1194,7 +1208,7 @@ void ShowPanel()
       R += g_trigR[t];
      }
    Comment(StringFormat(
-              "MomentumScalper v2  %s\n"
+              "MomentumScalper v2.1  %s\n"
               "Spread %s | M1 ATR %s | ATR/spread %.1f (gate %.1f) | flow %+.2f (%s) | speed %.1fx\n"
               "VWAP %s | POC %s | VA %s - %s\n"
               "Structure: last break %s%s | swing H %s | swing L %s | EQ %s\n"
