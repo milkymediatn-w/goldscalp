@@ -225,3 +225,44 @@ per account type):
    lowest one is the one to build on.
 
 Only setups that are positive net out of sample, on 300+ events, at a realistic cost, go into an EA.
+
+---
+
+# FastScalper v1: M1 scalper, every trade out within 10 minutes
+
+`Experts/FastScalper.mq5`. When an M1 candle closes it checks the three SetupProbe setups, with
+the same rules and the same ATR/EMA maths, so the probe's results carry over:
+
+| Setup | Signal | Trade |
+|---|---|---|
+| `A_squeeze` | Tight `InpSqzBars` range, then an expansion candle closes outside it | With the break |
+| `B_open` | First close outside a session's opening range (`InpSessions`, server time) | With the break |
+| `C_sweep` | Wick through the `InpSweepBars` high/low, close back inside | Fade it |
+
+If two setups fire on the same candle, A wins over B, and B over C.
+
+**Exits:** stop at `InpSlAtr` × ATR (at least `InpSlMinCosts` round-trip costs) and target at
+`InpTpR` × the stop, both held on the server. Break-even and trailing are optional and off by
+default. There is a hard **time stop at `InpMaxHoldMin` minutes** (default 10).
+
+**Filters on every signal:** entry hours (`InpHours`, e.g. `7-10,13-16`), trend side
+(`InpWithTrendOnly`), max spread, the cost gate (ATR ≥ `InpMinAtrToCost` × spread + commission),
+and a late-tick check.
+
+**Risk:** one position at a time, a stop on every trade, daily loss limit on equity, max trades per
+day, a pause after a losing streak, and fixed lots or a fixed % of equity (commission included),
+with a lot cap. Size never grows after a loss.
+
+**Observability:** an on-chart panel; a trade log in `MQL5/Files/FastScalper_<symbol>.csv`, which
+`analyze_trades.py` reads; and a report when the EA stops, with signals per setup and how many were
+skipped by each filter.
+
+## Test it
+
+1. Copy `Experts/FastScalper.mq5` into `MQL5/Experts/` and compile (F7).
+2. Strategy Tester: symbol `BTCUSD` (Pro) or `BTCUSDm` (Standard), **Every tick based on real
+   ticks**, deposit in **USD**, **Forward 1/3**, and also a run with **Random delay**. On Zero, set
+   `InpCommission`.
+3. Test one setup at a time first (`InpUseA` / `InpUseB` / `InpUseC`). Change only a few inputs,
+   and keep only settings that also work on the forward third with 300+ trades.
+4. Then run it on demo for 2–4 weeks and compare the demo log with the backtest before trading live.
