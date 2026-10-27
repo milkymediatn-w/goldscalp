@@ -43,7 +43,7 @@ for BTCUSDm.
 ## Protections
 
 - **Cost gate:** the candle's ATR must be at least `InpMinAtrToSpread` times the spread, and the
-  stop must be at least `InpSlMinSpreads` spreads.
+  stop must be at least `InpSlMinCosts` round-trip costs.
 - **Regime filters:** skip volatility spikes (ATR(14) above `InpMaxAtrSpikeX` times ATR(100)) and
   slow feeds (below `InpMinTickRate` ticks per second).
 - **Sizing:** position size from risk % of equity, with a lot cap.
@@ -148,7 +148,7 @@ see why it did or did not trade.
 - daily loss limit, trades per hour and per day, cooldown, losing-streak pause.
 
 **Exits:**
-- ATR stop of at least `InpSlMinSpreads` spreads. On sweep and FVG trades it sits beyond the wick
+- ATR stop of at least `InpSlMinCosts` round-trip costs. On sweep and FVG trades it sits beyond the wick
   or gap, capped at `InpSlMaxAtr`.
 - TP at `InpTpR` R.
 - Break-even, then an ATR trail.
@@ -184,7 +184,7 @@ minutes** would have made after the spread and commission. `analyze_probe.py` sl
 **How a trade is measured:**
 - Entry is the first tick after the candle closes plus `InpLatencyMs`, at the ask for longs and
   the bid for shorts. Exits use the other side, so the spread is always paid.
-- Every combination of stop (`InpSlAtrList` × ATR, at least `InpSlMinSpreads` spreads) and target
+- Every combination of stop (`InpSlAtrList` × ATR, at least `InpSlMinCosts` round-trip costs) and target
   (`InpTpRList` × the stop) is replayed, plus a time stop at `InpMaxHoldMin` minutes. Stops fill at
   the quote that crossed them (gaps count as slippage); targets fill at their price.
 - Results are also recorded for plain time exits after 1, 3, 5 and 10 minutes, with the best and
@@ -205,7 +205,7 @@ minutes** would have made after the spread and commission. `analyze_probe.py` sl
 
 ```
 python mt5/analyze_probe.py SetupProbe_BTCUSDm.csv
-python mt5/analyze_probe.py SetupProbe_BTCUSDm.csv --min-ratio 4            # cost gate: ATR >= 4x spread
+python mt5/analyze_probe.py SetupProbe_BTCUSDm.csv --min-ratio 4            # cost gate: ATR >= 4x (spread + commission)
 python mt5/analyze_probe.py SetupProbe_BTCUSDm.csv --hours 7-10,13-16       # active hours only
 python mt5/analyze_probe.py SetupProbe_BTCUSD.csv  --commission 7.0         # Zero: commission override
 ```

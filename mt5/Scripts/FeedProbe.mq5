@@ -12,6 +12,7 @@
 input int InpTicks      = 20000; // Recent ticks to analyse
 input int InpBookSecs   = 20;    // Seconds to watch the depth of market
 input int InpAtrPeriod  = 14;    // ATR period on M1
+input double InpCommission = 0.0; // Commission per 1 lot, round trip, account currency (Zero/Raw)
 
 void OnStart()
   {
@@ -77,11 +78,19 @@ void OnStart()
       Sleep(100);
      }
    IndicatorRelease(h);
-   if(gotAtr && med > 0.0)
+   double tv = SymbolInfoDouble(s, SYMBOL_TRADE_TICK_VALUE), ts = SymbolInfoDouble(s, SYMBOL_TRADE_TICK_SIZE);
+   double commPx = (tv > 0.0 && ts > 0.0) ? InpCommission * ts / tv : 0.0; // commission in price units
+   double cost = med + commPx;                                              // one round trip
+   if(gotAtr)
      {
-      PrintFormat("ATR(%d) on M1: %s = %.1f x median spread. One round trip costs %.0f%% of an average 1m bar%s.",
-                  InpAtrPeriod, DoubleToString(atr[0], _Digits), atr[0] / med, 100.0 * med / atr[0],
-                  " (plus commission on Raw/Zero accounts)");
+      PrintFormat("ATR(%d) on M1: %s | round trip cost = median spread %s + commission %s = %s (%.2f %s at 0.01 lot)",
+                  InpAtrPeriod, DoubleToString(atr[0], _Digits), DoubleToString(med, _Digits),
+                  DoubleToString(commPx, _Digits), DoubleToString(cost, _Digits),
+                  cost * (ts > 0.0 ? tv / ts : 0.0) * 0.01, AccountInfoString(ACCOUNT_CURRENCY));
+      if(cost > 0.0)
+         PrintFormat("ATR/cost %.1f: one round trip costs %.0f%% of an average 1m bar.", atr[0] / cost, 100.0 * cost / atr[0]);
+      else
+         Print("Spread and InpCommission are both 0: this is a commission account (Zero/Raw). Run again with InpCommission set to its per-lot round-trip commission.");
      }
 
    //--- depth of market
@@ -128,13 +137,13 @@ void OnStart()
       Print("Real trade prints with aggressor side: footprint / delta are REAL on this feed.");
    else
       Print("No aggressor-side trades: this is a quote feed (CFD). ScalpEngine falls back to the tick rule (direction of each quote change).");
-   if(gotAtr && med > 0.0)
+   if(gotAtr && cost > 0.0)
      {
-      double x = atr[0] / med;
+      double x = atr[0] / cost;
       if(x < 4.0)
-         PrintFormat("ATR/spread %.1f is below 4: a 1m scalp pays too much spread here. Trade quieter hours less, busier hours more, or a cheaper account type.", x);
+         PrintFormat("ATR/cost %.1f is below 4: a 1m scalp pays too much in costs here. Trade quieter hours less, busier hours more, or a cheaper account type.", x);
       else
-         PrintFormat("ATR/spread %.1f: costs are workable for 1m scalping if the signal has an edge.", x);
+         PrintFormat("ATR/cost %.1f: costs are workable for 1m scalping if the signal has an edge.", x);
      }
   }
 //+------------------------------------------------------------------+

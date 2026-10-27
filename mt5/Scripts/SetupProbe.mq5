@@ -76,7 +76,7 @@ input int      InpCooldownBars = 5;      // Min candles between two events of th
 input group "Exit grid"
 input string   InpSlAtrList    = "0.5,1.0,1.5"; // Stop distances, x fast ATR
 input string   InpTpRList      = "1,1.5,2,3";   // Targets, x stop (R)
-input double   InpSlMinSpreads = 2.0;    // Stop is at least this many spreads
+input double   InpSlMinCosts   = 2.0;    // Stop is at least this many round-trip costs (spread + commission)
 
 struct Ev
   {
@@ -107,6 +107,7 @@ Ev     g_ev[];
 int    g_n = 0;
 double g_slA[], g_tpR[];
 int    g_nC = 0;
+double g_cpx = 0.0; // commission per round trip, in price units
 
 //+------------------------------------------------------------------+
 int ParseList(const string s, double &out[])
@@ -240,7 +241,7 @@ bool Simulate(int k, const MqlTick &tk[], int nt)
    int    nOpen = g_nC;
    for(int c = 0; c < g_nC; c++)
      {
-      double sl = MathMax(g_slA[c / ArraySize(g_tpR)] * g_ev[k].atr, InpSlMinSpreads * spread);
+      double sl = MathMax(g_slA[c / ArraySize(g_tpR)] * g_ev[k].atr, InpSlMinCosts * (spread + g_cpx));
       g_ev[k].sl[c] = sl;
       tp[c]   = g_tpR[c % ArraySize(g_tpR)] * sl;
       live[c] = true;
@@ -320,7 +321,7 @@ void WriteCsv(long cutMsc, double usdPerPx, double commUsd)
       PrintFormat("Cannot write %s (error %d)", fname, GetLastError());
       return;
      }
-   string hdr = "time,setup,side,sample,hour,dow,spread,atr,atr_slow,atr_spread,aligned,f1,f2,entry,lots,usd_per_px,comm_usd";
+   string hdr = "time,setup,side,sample,hour,dow,spread,atr,atr_slow,atr_cost,aligned,f1,f2,entry,lots,usd_per_px,comm_usd";
    for(int h = 0; h < NH; h++)
       hdr += StringFormat(",mfe_%d,mae_%d,pnl_%d", g_hor[h], g_hor[h], g_hor[h]);
    for(int c = 0; c < g_nC; c++)
@@ -347,7 +348,7 @@ void WriteCsv(long cutMsc, double usdPerPx, double commUsd)
                               g_ev[k].entryMsc < cutMsc ? "IS" : "OOS",
                               dt.hour, dt.day_of_week,
                               Px(spr), Px(g_ev[k].atr), Px(g_ev[k].atrSlow),
-                              spr > 0.0 ? g_ev[k].atr / spr : 0.0,
+                              spr + g_cpx > 0.0 ? g_ev[k].atr / (spr + g_cpx) : 0.0,
                               g_ev[k].aligned, g_ev[k].f1, g_ev[k].f2,
                               Px(g_ev[k].entry), InpLots, usdPerPx, commUsd);
       for(int h = 0; h < NH; h++)
@@ -365,7 +366,7 @@ void WriteCsv(long cutMsc, double usdPerPx, double commUsd)
 //+------------------------------------------------------------------+
 void PrintSummary(long cutMsc, double usdPerPx, double commUsd)
   {
-   double cpx = usdPerPx > 0.0 ? commUsd / usdPerPx : 0.0; // commission in price units
+   double cpx = g_cpx;
    // control result per combo, to compare each setup against no signal
    double ctrlGross[MAXC];
    ArrayInitialize(ctrlGross, 0.0);
@@ -402,11 +403,12 @@ void PrintSummary(long cutMsc, double usdPerPx, double commUsd)
          n[p]++;
          for(int h = 0; h < NH; h++)
             hSum[p][h] += g_ev[k].pnlH[h] - cpx;
-         if(p == 0 && g_ev[k].spread > 0.0)
+         double cost = g_ev[k].spread + cpx;
+         if(p == 0 && cost > 0.0)
            {
-            mfe10  += g_ev[k].mfe[NH - 1] / g_ev[k].spread;
-            mae10  += g_ev[k].mae[NH - 1] / g_ev[k].spread;
-            sprSum += g_ev[k].spread;
+            mfe10  += g_ev[k].mfe[NH - 1] / cost;
+            mae10  += g_ev[k].mae[NH - 1] / cost;
+            sprSum += cost;
            }
          for(int c = 0; c < g_nC; c++)
            {
@@ -432,7 +434,7 @@ void PrintSummary(long cutMsc, double usdPerPx, double commUsd)
       PrintFormat("== %s: %d events (in sample %d, out of sample %d)%s", g_names[s], n[0] + n[1], n[0], n[1],
                   n[1] < 300 ? "  !! fewer than 300 out of sample" : "");
       if(n[0] > 0)
-         PrintFormat("   In sample: avg spread %s | within 10 min the best move averages %.1f spreads, the worst %.1f spreads",
+         PrintFormat("   In sample: avg round-trip cost %s | within 10 min the best move averages %.1f costs, the worst %.1f costs",
                      Px(sprSum / n[0]), mfe10 / n[0], mae10 / n[0]);
       for(int p = 0; p < 2; p++)
          if(n[p] > 0)
@@ -635,6 +637,10 @@ void OnStart()
    if(g_n == 0)
       return;
 
+   double tv = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double ts = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   g_cpx = (tv > 0.0 && ts > 0.0) ? InpCommission * ts / tv : 0.0;
+
    //--- replay ticks, one day at a time
    const long dayMs = 86400000;
    int k0 = 0, days = 0, noTicks = 0, gaps = 0;
@@ -664,8 +670,6 @@ void OnStart()
                days, noTicks, gaps);
 
    //--- money
-   double tv = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   double ts = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
    double usdPerPx = ts > 0.0 ? tv / ts * InpLots : 0.0;
    double commUsd  = InpCommission * InpLots;
    long   cutMsc   = ((long)InpFrom + (long)((1.0 - InpOosFrac) * (double)((long)InpTo - (long)InpFrom))) * 1000;

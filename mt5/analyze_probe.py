@@ -13,7 +13,8 @@ future. Judge nothing with fewer than ~300 OOS events.
 
 --commission  per 1 lot, round trip, in account currency. Overrides what the
               script was run with (for Zero/Raw accounts).
---min-ratio   keep only events where fast ATR >= this x spread (the cost gate).
+--min-ratio   keep only events where fast ATR >= this x the round-trip cost
+              (spread + commission): the cost gate.
 --hours       keep only these entry hours, server time, e.g. "7-10,13-16".
 --combo       exit setting for the breakdowns, e.g. sl1.00_tp2.00. Default: the
               best in-sample setting of each setup.
@@ -93,13 +94,15 @@ def main() -> None:
         df[f"usd_{c}"] = df[f"net_{c}"] * df["usd_per_px"] - comm
         df[f"gusd_{c}"] = df[f"gross_{c}"] * df["usd_per_px"]
         df[f"r_{c}"] = df[f"usd_{c}"] / (df[f"sl_{c}"] * df["usd_per_px"])
+    df["cost_px"] = df["spread"] + comm / df["usd_per_px"]
+    df["atr_cost"] = df["atr"] / df["cost_px"]
     for h in HORIZONS:
         df[f"usd_{h}m"] = df[f"pnl_{h}"] * df["usd_per_px"] - comm
 
     filters = []
     if args.min_ratio > 0:
-        df = df[df["atr_spread"] >= args.min_ratio]
-        filters.append(f"ATR/spread >= {args.min_ratio}")
+        df = df[df["atr_cost"] >= args.min_ratio]
+        filters.append(f"ATR/cost >= {args.min_ratio}")
     if args.hours:
         df = df[df["hour"].isin(parse_hours(args.hours))]
         filters.append(f"hours {args.hours}")
@@ -113,8 +116,8 @@ def main() -> None:
     print(f"lots {df.lots.iloc[0]}, commission per trade {comm.mean():.3f}"
           f"{', filters: ' + ', '.join(filters) if filters else ''}")
     print("net$ = per trade after spread and commission; gross$ = mid to mid, before costs.")
-    print(f"avg spread {df.spread.mean():.3f} | avg fast ATR {df.atr.mean():.3f} | "
-          f"avg ATR/spread {df.atr_spread.mean():.1f}")
+    print(f"avg spread {df.spread.mean():.3f} | avg round-trip cost {df.cost_px.mean():.3f} | "
+          f"avg fast ATR {df.atr.mean():.3f} | avg ATR/cost {df.atr_cost.mean():.1f} (price units)")
 
     ctrl = df[df.setup == "control"]
     for setup, d in df.groupby("setup"):
@@ -125,10 +128,10 @@ def main() -> None:
         print("\n-- time exit only (no stop, no target), net $/trade --")
         print(d.groupby("sample")[[f"usd_{h}m" for h in HORIZONS]].mean()
               .reindex(["IS", "OOS"]).rename(columns=lambda c: c.replace("usd_", "exit ")))
-        print("\n-- excursions within 10 min, in spreads (IS) --")
+        print("\n-- excursions within 10 min, in round-trip costs (IS) --")
         is_ = d[d["sample"] == "IS"]
-        print(f"best move: median {(is_.mfe_10 / is_.spread).median():.1f}, "
-              f"worst move: median {(is_.mae_10 / is_.spread).median():.1f}")
+        print(f"best move: median {(is_.mfe_10 / is_.cost_px).median():.1f}, "
+              f"worst move: median {(is_.mae_10 / is_.cost_px).median():.1f}")
 
         table = combo_table(d, combos)
         print("\n-- every exit setting, sorted by IS net$ --")
@@ -149,8 +152,8 @@ def main() -> None:
         print("\nby trend alignment (1 = with the EMA trend)"); print(breakdown(d, "aligned", combo))
         print("\nby hour (server time)"); print(breakdown(d, "hour", combo))
         try:
-            d["ratio_q"] = pd.qcut(d["atr_spread"], 5, duplicates="drop")
-            print("\nby ATR/spread quintile"); print(breakdown(d, "ratio_q", combo))
+            d["ratio_q"] = pd.qcut(d["atr_cost"], 5, duplicates="drop")
+            print("\nby ATR/cost quintile"); print(breakdown(d, "ratio_q", combo))
         except ValueError:
             pass
 
