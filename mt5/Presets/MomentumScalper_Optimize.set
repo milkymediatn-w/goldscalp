@@ -1,0 +1,23 @@
+; MomentumScalper v2.1 - optimisation ranges. Format: value||start||step||stop||Y (Y = optimise this input).
+; Strategy Tester: Optimization = "Fast genetic based algorithm", criterion = "Custom max", Forward = 1/3.
+InpRiskPercent=0.0||0.0||0.0||0.0||N
+InpFixedLots=0.01||0.01||0.01||0.01||N
+InpMinScore=65||50||5||85||Y
+InpTrigMinFlow=0.25||0.15||0.05||0.5||Y
+InpMinAtrToSpread=3.5||2.0||0.5||6.0||Y
+InpUseBurst=true||false||0||true||Y
+InpUseBos=true||false||0||true||Y
+InpUseSweep=true||false||0||true||Y
+InpUseFvg=true||false||0||true||Y
+InpSlAtr=1.0||0.6||0.2||2.0||Y
+InpTpR=1.0||0.3||0.1||2.0||Y
+InpBreakEvenR=0.5||0.0||0.1||0.8||Y
+InpTrailStartR=0.8||0.0||0.4||1.6||Y
+InpMaxHoldSec=300||120||60||600||Y
+InpFlowExit=false||false||0||true||N
+InpBurstMinSpreads=1.8||1.2||0.3||3.0||Y
+InpMaxDailyLossPct=5.0||5.0||1.0||5.0||N
+InpSessionStartHour=0||0||1||0||N
+InpSessionEndHour=24||24||1||24||N
+InpTradeWeekends=true||false||0||true||N
+InpOptMinTrades=200||200||1||200||N

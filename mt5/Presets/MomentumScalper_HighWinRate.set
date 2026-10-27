@@ -1,0 +1,20 @@
+; MomentumScalper v2 - high win-rate profile: wider stop, small target, early break-even, no trail.
+; Break-even win rate on BTCUSDm is roughly 65-70% with these exits: the backtest must beat that.
+InpRiskPercent=0.0
+InpFixedLots=0.01
+InpMinScore=60
+InpTrigMinFlow=0.30
+InpSlAtr=1.4
+InpSlMinSpreads=3.5
+InpSlMaxAtr=2.0
+InpTpR=0.45
+InpBreakEvenR=0.3
+InpTrailStartR=0.0
+InpMaxHoldSec=300
+InpFlowExit=true
+InpExitFlow=0.6
+InpFlowExitMaxR=0.2
+InpRoomR=0.5
+InpSessionStartHour=0
+InpSessionEndHour=24
+InpTradeWeekends=true
