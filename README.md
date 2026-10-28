@@ -15,7 +15,7 @@
 - `backtest.py` runs the exact live logic over history
 - `apifinder.py` searches the public-apis catalogue for new data sources (`python apifinder.py --preset gold`); shortlist in `DATA_SOURCES.md`
 
-## Gold data feed (OANDA, default)
+## Gold data feed (OANDA, optional)
 - Open a free OANDA **practice** account, then My Account -> Manage API Access -> Generate token.
 - Set `DATA_SOURCE=oanda`, `OANDA_TOKEN=<token>`, `OANDA_ENV=practice` (use `live` only with a live-account token).
 - You get spot XAU/USD candles plus the live bid/ask spread. One request per scan is far below OANDA's rate limits.

@@ -53,7 +53,7 @@ class Config:
     assumed_spread: float = 0.30
 
     # --- data ---
-    data_source: str = "oanda"   # oanda | yfinance
+    data_source: str = "yfinance"   # oanda | yfinance
     bars: int = 3000
     mt5_symbol: str = "XAUUSDm"
     mt5_login: str = ""
