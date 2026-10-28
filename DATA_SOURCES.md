@@ -5,7 +5,10 @@ Shortlist pulled from the [public-apis](https://github.com/public-apis/public-ap
 the catalogue. None of these are wired into `data.py` yet. Check each one's free-tier limits, candle
 granularity and latency before relying on it.
 
-Current feeds: **OANDA v20** spot XAU/USD (chosen, not in the catalogue), Coinbase spot (BTC), yfinance `GC=F` futures as fallback.
+Current feeds: yfinance `GC=F` gold **futures** (default), Coinbase spot (BTC).
+An OANDA v20 spot fetcher exists in `data.py` (`DATA_SOURCE=oanda`) but OANDA doesn't accept accounts from our region.
+Parked until real data is available. Options considered: cTrader Open API (spot, free with a demo account),
+Databento (CME GC/MGC futures, not spot), PAXG token as a stopgap.
 
 ## Gold price (XAUUSD)
 | API | Key | Why it's interesting |
