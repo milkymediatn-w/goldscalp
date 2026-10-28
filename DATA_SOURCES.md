@@ -11,7 +11,6 @@ Current feeds: MT5 (broker), yfinance `GC=F` (gold **futures**, not spot), Coinb
 | API | Key | Why it's interesting |
 |---|---|---|
 | [Goldprice.dev](https://goldprice.dev/docs) | none | Gold/silver/copper spot **and** futures, 30-year history. Could provide spot to sanity-check the `GC=F` futures basis. |
-| [Twelve Data](https://twelvedata.com/) | apiKey | Already mentioned in our README. Has `XAU/USD` intraday candles, so it's the closest drop-in for scalping. |
 | [Finage](https://finage.co.uk) | apiKey | Forex, indices and crypto, real-time and historical. |
 | [TickerLayer](https://tickerlayer.com) | apiKey | Stocks, forex and crypto, real-time and historical. |
 | [Finnhub](https://finnhub.io/docs/api) | apiKey | REST plus a **websocket** for forex/crypto, which suits tick-level spread checks. |

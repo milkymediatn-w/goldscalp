@@ -53,7 +53,7 @@ class Config:
     assumed_spread: float = 0.30
 
     # --- data ---
-    data_source: str = "twelvedata"   # mt5 | twelvedata | yfinance
+    data_source: str = "yfinance"   # mt5 | yfinance
     bars: int = 3000
     mt5_symbol: str = "XAUUSDm"
     mt5_login: str = ""
@@ -61,7 +61,6 @@ class Config:
     mt5_server: str = ""
     mt5_path: str = ""
     mt5_utc_offset: str = ""
-    twelve_api_key: str = "2ec136a3edfe4dce9b4dd05f40f62dd9"
 
     def summary(self) -> str:
         return (f"{self.preset} | {self.tf_min}m (HTF {self.htf_min}m) | 8-EMA Ribbon | "

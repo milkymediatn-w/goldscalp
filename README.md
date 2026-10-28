@@ -9,7 +9,7 @@
 
 ## Files
 - `config.py`   presets + every tunable input (override any field from .env)
-- `data.py`     MT5 / Twelve Data / yfinance feeds
+- `data.py`     MT5 / yfinance / Coinbase feeds
 - `strategy.py` indicators, confluence scoring, TP1/2/3 trade simulation
 - `bot.py`      Telegram UI, subscriptions, scanner, outcome tracking
 - `backtest.py` runs the exact live logic over history
