@@ -13,6 +13,7 @@
 - `strategy.py` indicators, confluence scoring, TP1/2/3 trade simulation
 - `bot.py`      Telegram UI, subscriptions, scanner, outcome tracking
 - `backtest.py` runs the exact live logic over history
+- `apifinder.py` searches the public-apis catalogue for new data sources (`python apifinder.py --preset gold`); shortlist in `DATA_SOURCES.md`
 
 ## Using your MT5 account as the data feed
 - MT5's Python API is **Windows only** and talks to a desktop terminal. Install MT5 from your broker on the
