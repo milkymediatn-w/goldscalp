@@ -1,5 +1,5 @@
 """
-Market data layer supporting Coinbase Direct Spot (BTCUSD) and Yahoo Finance (XAUUSD).
+Market data layer: OANDA v20 spot (XAUUSD), Coinbase Direct Spot (BTCUSD), Yahoo Finance fallback.
 Returns closed candles indexed in UTC, plus live spread when available.
 """
 import threading
@@ -53,6 +53,40 @@ def _fetch_coinbase(cfg: Config, symbol: str = "BTCUSD") -> pd.DataFrame:
     return df[["open", "high", "low", "close", "volume"]]
 
 
+_OANDA_HOSTS = {"practice": "https://api-fxpractice.oanda.com", "live": "https://api-fxtrade.oanda.com"}
+
+
+def _fetch_oanda(cfg: Config, instrument: str = "XAU_USD") -> tuple[pd.DataFrame, Optional[float]]:
+    """OANDA v20 spot candles (mid OHLC + tick volume) and the latest bid/ask spread."""
+    host = _OANDA_HOSTS[cfg.oanda_env.lower()]
+    r = httpx.get(
+        f"{host}/v3/instruments/{instrument}/candles",
+        params={"granularity": f"M{cfg.tf_min}" if cfg.tf_min < 60 else "H1",
+                "count": min(cfg.bars, 5000), "price": "MBA"},
+        headers={"Authorization": f"Bearer {cfg.oanda_token}"},
+        timeout=10,
+    )
+    r.raise_for_status()
+    candles = r.json()["candles"]
+
+    data = []
+    for c in candles:
+        m = c["mid"]
+        data.append({
+            "datetime": pd.to_datetime(c["time"], utc=True),
+            "open": float(m["o"]),
+            "high": float(m["h"]),
+            "low": float(m["l"]),
+            "close": float(m["c"]),
+            "volume": float(c["volume"]),
+        })
+
+    last = candles[-1]
+    spread = float(last["ask"]["c"]) - float(last["bid"]["c"])
+    df = pd.DataFrame(data).set_index("datetime").sort_index()
+    return df[["open", "high", "low", "close", "volume"]], spread
+
+
 def _fetch_yf(cfg: Config, symbol: str = "XAUUSD") -> pd.DataFrame:
     import yfinance as yf
     # Valid active ticker for Gold on Yahoo Finance
@@ -73,6 +107,11 @@ def get_candles(cfg: Config, symbol: str = "XAUUSD") -> Feed:
     if symbol.upper() in ("BTCUSD", "BTCUSDT"):
         df = _fetch_coinbase(cfg, "BTCUSD")
         source_label = "coinbase-spot"
+    elif symbol.upper() in ("XAUUSD", "GOLD") and src == "oanda":
+        if not cfg.oanda_token:
+            raise RuntimeError("DATA_SOURCE=oanda but OANDA_TOKEN is empty (or set DATA_SOURCE=yfinance)")
+        df, spread = _fetch_oanda(cfg, "XAU_USD")
+        source_label = f"oanda-{cfg.oanda_env.lower()}"
     elif symbol.upper() in ("XAUUSD", "GOLD"):
         df = _fetch_yf(cfg, "XAUUSD")
         source_label = "yfinance-gold"

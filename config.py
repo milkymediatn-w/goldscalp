@@ -53,7 +53,7 @@ class Config:
     assumed_spread: float = 0.30
 
     # --- data ---
-    data_source: str = "yfinance"   # mt5 | yfinance
+    data_source: str = "oanda"   # oanda | yfinance
     bars: int = 3000
     mt5_symbol: str = "XAUUSDm"
     mt5_login: str = ""
@@ -61,6 +61,8 @@ class Config:
     mt5_server: str = ""
     mt5_path: str = ""
     mt5_utc_offset: str = ""
+    oanda_token: str = ""
+    oanda_env: str = "practice"   # practice | live
 
     def summary(self) -> str:
         return (f"{self.preset} | {self.tf_min}m (HTF {self.htf_min}m) | 8-EMA Ribbon | "

@@ -5,7 +5,7 @@ Shortlist pulled from the [public-apis](https://github.com/public-apis/public-ap
 the catalogue. None of these are wired into `data.py` yet. Check each one's free-tier limits, candle
 granularity and latency before relying on it.
 
-Current feeds: MT5 (broker), yfinance `GC=F` (gold **futures**, not spot), Coinbase spot (BTC).
+Current feeds: **OANDA v20** spot XAU/USD (chosen, not in the catalogue), Coinbase spot (BTC), yfinance `GC=F` futures as fallback.
 
 ## Gold price (XAUUSD)
 | API | Key | Why it's interesting |

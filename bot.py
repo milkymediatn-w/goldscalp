@@ -11,7 +11,7 @@ import uvicorn
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-from config import Config
+from config import load_config
 from data import get_candles
 from strategy import evaluate_strategy
 
@@ -75,7 +75,7 @@ last_signals = {}
 
 
 async def scan_market(context: ContextTypes.DEFAULT_TYPE):
-    cfg = Config()
+    cfg = load_config()
     symbols = ["XAUUSD", "BTCUSD"]
 
     for symbol in symbols:

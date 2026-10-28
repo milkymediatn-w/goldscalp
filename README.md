@@ -9,11 +9,17 @@
 
 ## Files
 - `config.py`   presets + every tunable input (override any field from .env)
-- `data.py`     MT5 / yfinance / Coinbase feeds
+- `data.py`     OANDA (gold spot) / Coinbase (BTC) / yfinance fallback feeds
 - `strategy.py` indicators, confluence scoring, TP1/2/3 trade simulation
 - `bot.py`      Telegram UI, subscriptions, scanner, outcome tracking
 - `backtest.py` runs the exact live logic over history
 - `apifinder.py` searches the public-apis catalogue for new data sources (`python apifinder.py --preset gold`); shortlist in `DATA_SOURCES.md`
+
+## Gold data feed (OANDA, default)
+- Open a free OANDA **practice** account, then My Account -> Manage API Access -> Generate token.
+- Set `DATA_SOURCE=oanda`, `OANDA_TOKEN=<token>`, `OANDA_ENV=practice` (use `live` only with a live-account token).
+- You get spot XAU/USD candles plus the live bid/ask spread. One request per scan is far below OANDA's rate limits.
+- `DATA_SOURCE=yfinance` falls back to `GC=F` gold **futures**, which trade a few dollars away from spot.
 
 ## Using your MT5 account as the data feed
 - MT5's Python API is **Windows only** and talks to a desktop terminal. Install MT5 from your broker on the
